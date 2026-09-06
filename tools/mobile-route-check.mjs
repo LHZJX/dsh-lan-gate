@@ -50,6 +50,8 @@ upstream.listen(0, '127.0.0.1', async () => {
   await check('/mobile/index.html', 200, 'viewport')
   await check('/mobile/app.js', 200, 'checkAuth')
   await check('/mobile/style.css', 200, '--accent')
+  await check('/mobile/manifest.webmanifest', 200, 'display')
+  await check('/mobile/icon.svg', 200, '<svg')
   await check('/mobile/secret.js', 404, null)
   await check('/', 200, 'upstream')
   // traversal attempts must never leak plugin sources (URL parsing in pathOf
