@@ -35,6 +35,7 @@ const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 const LS_LAST_WS = 'dsh.mobile.lastWs';
 const LS_WS_CLOSED = 'dsh.mobile.wsClosed';
+const LS_BG = 'dsh.mobile.bg'; // 自定义背景 {img, dim} —— 仅存本机浏览器
 
 // ── 工具 ────────────────────────────────────────────────────────────
 
@@ -288,6 +289,11 @@ async function loadHistory(sessionId) {
   const { items, leftovers, minSeq } = foldHistoryEvents(events, sessionId);
   for (const it of items) flow.push(it);
   for (const it of leftovers) flow.push(it);
+  // 兜底:重建后若已出现“上下文已压缩”标记,说明压缩早已完成,清掉进行中状态
+  const cmr0 = compactRun.get(sessionId);
+  if (cmr0 && cmr0.running && items.some((x) => x.kind === 'compact')) {
+    cmr0.running = false; cmr0.done = true; cmr0.reloaded = true;
+  }
   let maxSeq = -1;
   for (const { event } of events || []) {
     if (event && typeof event.seq === 'number' && event.seq > maxSeq) maxSeq = event.seq;
@@ -402,10 +408,39 @@ function applyLiveEvent(sessionId, event) {
   const flow = ensureFlow(sessionId);
   let changed = false;
 
-  // 压缩生命周期 / checkpoint 消息:不做普通气泡处理,延迟整体重建让“已压缩”标记与遮蔽一致
+  // 压缩生命周期 / checkpoint 消息:更新进度状态;标记由 checkpoint 到达后的重建呈现
   if (type === 'compaction/start' || type === 'compaction/summary' || type === 'compaction/end' ||
       ((type === 'user/message' || type === 'assistant/message') && compactOf(data.message || data))) {
-    scheduleCompactionReload(sessionId);
+    const st2 = compactState(sessionId);
+    if (type === 'compaction/start') {
+      st2.running = true; st2.done = false; st2.reloaded = false; st2.summarized = false;
+      if (!st2.startedAt) st2.startedAt = Date.now();
+      changed = true;
+    } else if (type === 'compaction/summary') {
+      if (typeof data.shadowedTokenCount === 'number') st2.tokens = data.shadowedTokenCount;
+      if (Array.isArray(data.shadowedSeqs)) st2.items = data.shadowedSeqs.length;
+      st2.summarized = true;
+      changed = true;
+    } else if (type === 'compaction/end') {
+      st2.running = false; st2.done = true;
+      if (!st2.reloaded) { st2.reloaded = true; scheduleCompactionReload(sessionId); }
+      if (sessionId === state.session && !st2.toasted) {
+        st2.toasted = true;
+        toast(data.error ? '压缩失败:' + (data.error.message || data.error.code) : compactDoneText(st2));
+      }
+      changed = true;
+    } else {
+      // checkpoint(user/message 替换) → 重建以显示“上下文已压缩”标记
+      st2.running = false; st2.done = true;
+      if (!st2.reloaded) { st2.reloaded = true; scheduleCompactionReload(sessionId); }
+      if (sessionId === state.session && !st2.toasted) {
+        st2.toasted = true;
+        toast(compactDoneText(st2));
+      }
+      changed = true;
+    }
+    // 实时同步进度条(开始→显示;摘要→换文案;结束/checkpoint→隐藏),无需整页重绘
+    if (sessionId === state.session) updateCompactBar();
     return changed;
   }
 
@@ -529,6 +564,12 @@ function patchLiveChat(sessionId, it) {
 function onFrame(frame) {
   const payload = frame.payload || frame;
   const type = payload.type;
+  // 审批/选项卡片的 server-request 帧:应答需回显 frame.rpcId(POST /api/respond)
+  const frameRpcId = frame && frame.rpcId;
+  if (type === 'approval/requested' && payload.sessionId) { onApprovalRequested(frameRpcId, payload); return; }
+  if (type === 'approval/resolved' && payload.sessionId) { onApprovalResolved(payload); return; }
+  if (type === 'question/requested' && payload.sessionId) { onQuestionRequested(frameRpcId, payload); return; }
+  if (type === 'question/resolved' && payload.sessionId) { onQuestionResolved(payload); return; }
   if (type === 'session/subscribed') {
     if (payload.sessionId) state.seqBySession.set(payload.sessionId, typeof payload.lastSeq === 'number' ? payload.lastSeq : -1);
     return;
@@ -663,6 +704,9 @@ const ICONS = {
   bot: '<rect x="4" y="7" width="16" height="11" rx="3"/><circle cx="9" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="15" cy="12" r="1.4" fill="currentColor" stroke="none"/><path d="M12 7V3"/><circle cx="12" cy="2.2" r="1.2" fill="currentColor" stroke="none"/>',
   warn: '<path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>',
   fold: '<path d="M8 3v3a2 2 0 0 1-2 2H3"/><path d="M21 8h-3a2 2 0 0 1-2-2V3"/><path d="M3 16h3a2 2 0 0 1 2 2v3"/><path d="M16 21v-3a2 2 0 0 1 2-2h3"/>',
+  image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/>',
+  shield: '<path d="M12 2l8 4v6c0 5-3.4 8.6-8 10-4.6-1.4-8-5-8-10V6z"/>',
+  ask: '<circle cx="12" cy="12" r="9"/><path d="M9.3 9.2a2.7 2.7 0 0 1 5.3 1c0 1.5-2.6 2.1-2.6 3.4"/><path d="M12 17h.01"/>',
 };
 
 function icon(name) {
@@ -865,6 +909,52 @@ function scheduleCompactionReload(sessionId) {
   }, 400);
 }
 
+/** 每个会话的压缩进行状态(用于进度提示/完成通知):{running, summarized, done, items, tokens, startedAt, reloaded, toasted} */
+const compactRun = new Map();
+function compactState(sessionId) {
+  let st = compactRun.get(sessionId);
+  if (!st) { st = {}; compactRun.set(sessionId, st); }
+  return st;
+}
+function compactDoneText(st) {
+  let t = '压缩完成';
+  const bits = [];
+  if (st && st.items) bits.push(`已折叠 ${st.items} 条历史记录`);
+  if (st && st.tokens) bits.push(`约 ${fmtTokens(st.tokens)} tokens`);
+  return bits.length ? t + ':' + bits.join(',') : t;
+}
+
+const COMPACT_BAR_MS = 6 * 60e3; // 进度条最长展示 6 分钟,防止事件丢失时永远挂着
+
+/** 更新“正在压缩”进度条(位于顶栏下方、消息区上方,固定可见,不随消息滚动)。
+ *  仅在无事件也超时时自动隐藏;正常结束由 compaction/end 或 checkpoint 置 running=false。 */
+function updateCompactBar() {
+  const bar = document.querySelector('[data-role="compact-bar"]');
+  if (!bar) return;
+  const sid = state.session;
+  const cmr = sid && compactRun.get(sid);
+  const active = !!(cmr && cmr.running && (!cmr.startedAt || Date.now() - cmr.startedAt < COMPACT_BAR_MS));
+  bar.classList.toggle('hidden', !active);
+  if (active) {
+    const txt = bar.querySelector('[data-role="compact-text"]');
+    if (txt) txt.textContent = cmr.summarized
+      ? '正在压缩上下文…摘要已生成,即将完成'
+      : '正在压缩上下文…通常需要数十秒到几分钟';
+  }
+}
+
+/** 超时兜底:超过 6 分钟仍未结束则隐藏进度条并提示(会话可能过大或事件未送达)。 */
+function compactTimeout(sid) {
+  setTimeout(() => {
+    const st = compactRun.get(sid);
+    if (st && st.running) {
+      st.running = false; st.timedOut = true;
+      updateCompactBar();
+      toast('压缩超过 6 分钟仍未完成,已隐藏进度条;请到电脑端查看状态后重试');
+    }
+  }, COMPACT_BAR_MS);
+}
+
 function loadWsClosed() {
   try { wsClosed = new Set(JSON.parse(localStorage.getItem(LS_WS_CLOSED) || '[]')); } catch { wsClosed = new Set(); }
 }
@@ -952,6 +1042,168 @@ function toolCardHtml(t) {
 
 // ── 界面 ────────────────────────────────────────────────────────────
 
+// ── 自定义背景(仅本机保存,不影响其它设备) ─────────────────────────
+
+function loadBg() {
+  try {
+    const v = JSON.parse(localStorage.getItem(LS_BG) || 'null');
+    if (!v || !v.img) return null;
+    return {
+      img: v.img,
+      dim: typeof v.dim === 'number' ? v.dim : 0.62,
+      bubble: typeof v.bubble === 'number' ? v.bubble : 1,
+      panel: typeof v.panel === 'number' ? v.panel : 1,
+      blur: v.blur === true,
+    };
+  } catch { return null; }
+}
+function saveBg(bg) {
+  try {
+    if (bg && bg.img) localStorage.setItem(LS_BG, JSON.stringify({ img: bg.img, dim: bg.dim, bubble: bg.bubble, panel: bg.panel, blur: bg.blur === true }));
+    else localStorage.removeItem(LS_BG);
+    return true;
+  } catch { return false; }
+}
+/** 应用背景 + 气泡/面板透明度(+可选毛玻璃)。透明度无论有无背景都生效。 */
+function applyBg(bg) {
+  const b = document.body;
+  if (!b) return;
+  const bubble = bg && typeof bg.bubble === 'number' ? bg.bubble : 1;
+  const panel = bg && typeof bg.panel === 'number' ? bg.panel : 1;
+  b.style.setProperty('--bubble-pct', `${Math.round(Math.min(1, Math.max(0, bubble)) * 100)}%`);
+  b.style.setProperty('--panel-pct', `${Math.round(Math.min(1, Math.max(0, panel)) * 100)}%`);
+  if (!bg || !bg.img) {
+    b.style.backgroundImage = '';
+    b.classList.remove('bg-on', 'bg-blur');
+    return;
+  }
+  const d = typeof bg.dim === 'number' ? bg.dim : 0.62;
+  const safe = String(bg.img).replace(/"/g, '');
+  b.style.backgroundImage = `linear-gradient(rgba(5,7,10,${d}), rgba(5,7,10,${d})), url("${safe}")`;
+  b.style.backgroundSize = 'cover';
+  b.style.backgroundPosition = 'center';
+  b.style.backgroundAttachment = 'fixed';
+  b.classList.add('bg-on');
+  b.classList.toggle('bg-blur', bg.blur === true);
+}
+/** 读取本地图片并压缩成 dataURL(最长边 1600,JPEG),避免超出 localStorage 容量。 */
+function fileToBgData(file) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const max = 1600;
+          const s = Math.min(1, max / Math.max(img.width, img.height));
+          const w = Math.max(1, Math.round(img.width * s));
+          const h = Math.max(1, Math.round(img.height * s));
+          const c = document.createElement('canvas');
+          c.width = w; c.height = h;
+          c.getContext('2d').drawImage(img, 0, 0, w, h);
+          resolve(c.toDataURL('image/jpeg', 0.85));
+        } catch (e) { reject(e); }
+      };
+      img.onerror = () => reject(new Error('无法解析该图片'));
+      img.src = fr.result;
+    };
+    fr.onerror = () => reject(new Error('读取文件失败'));
+    fr.readAsDataURL(file);
+  });
+}
+
+function bgMenu() {
+  const saved = loadBg();
+  const st = {
+    img: saved ? saved.img : '',
+    dim: saved ? saved.dim : 0.62,
+    bubble: saved ? saved.bubble : 1,
+    panel: saved ? saved.panel : 1,
+    blur: saved ? saved.blur === true : false,
+  };
+  const card = el('div', 'login-card', `
+    <h1>背景与气泡</h1>
+    <p>背景只保存在本机浏览器;气泡透明度控制消息底色的通透程度。</p>
+    <div class="bg-preview" data-role="bg-preview"></div>
+    <label class="btn btn-ghost" data-role="pick" style="text-align:center">从相册/文件选择…</label>
+    <input type="file" accept="image/*" hidden data-role="file" />
+    <input type="text" data-role="url" placeholder="或粘贴图片网址(https://…)" style="margin-top:10px" />
+    <div class="bg-dim-row"><span>暗化</span><input type="range" min="30" max="85" step="1" data-role="dim" /><span data-role="dimval"></span></div>
+    <div class="bg-dim-row"><span>气泡透明度</span><input type="range" min="20" max="100" step="1" data-role="bub" /><span data-role="bubval"></span></div>
+    <div class="bg-dim-row"><span>顶栏/输入区透明度</span><input type="range" min="20" max="100" step="1" data-role="pan" /><span data-role="panval"></span></div>
+    <div class="bg-dim-row"><label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" data-role="blur" style="width:18px;height:18px;accent-color:var(--accent)" /> 毛玻璃(气泡后背景模糊)</label></div>
+    <div class="error"></div>
+    <button class="btn" type="button" data-role="ok">应用</button>
+    <button class="btn btn-ghost" type="button" data-role="clear">清除背景</button>
+    <button class="btn btn-ghost" type="button" data-role="cancel">取消</button>`);
+  const preview = card.querySelector('[data-role="bg-preview"]');
+  const fileEl = card.querySelector('[data-role="file"]');
+  const urlEl = card.querySelector('[data-role="url"]');
+  const dimEl = card.querySelector('[data-role="dim"]');
+  const dimVal = card.querySelector('[data-role="dimval"]');
+  const bubEl = card.querySelector('[data-role="bub"]');
+  const bubVal = card.querySelector('[data-role="bubval"]');
+  const panEl = card.querySelector('[data-role="pan"]');
+  const panVal = card.querySelector('[data-role="panval"]');
+  const blurEl = card.querySelector('[data-role="blur"]');
+  const err = card.querySelector('.error');
+  const paint = () => { applyBg(st); };
+  const refresh = () => {
+    preview.innerHTML = st.img ? `<img src="${st.img.replace(/"/g, '')}">` : '<span>未设置</span>';
+    urlEl.value = /^data:/.test(st.img) ? '' : st.img;
+    dimEl.value = Math.round(st.dim * 100);
+    dimVal.textContent = dimEl.value + '%';
+    bubEl.value = Math.round(st.bubble * 100);
+    bubVal.textContent = bubEl.value + '%';
+    panEl.value = Math.round(st.panel * 100);
+    panVal.textContent = panEl.value + '%';
+    blurEl.checked = st.blur === true;
+  };
+  dimEl.oninput = () => { st.dim = Number(dimEl.value) / 100; dimVal.textContent = dimEl.value + '%'; paint(); };
+  bubEl.oninput = () => { st.bubble = Number(bubEl.value) / 100; bubVal.textContent = bubEl.value + '%'; paint(); };
+  panEl.oninput = () => { st.panel = Number(panEl.value) / 100; panVal.textContent = panEl.value + '%'; paint(); };
+  blurEl.onchange = () => { st.blur = blurEl.checked; paint(); };
+  card.querySelector('[data-role="pick"]').onclick = () => fileEl.click();
+  fileEl.onchange = async () => {
+    const f = fileEl.files && fileEl.files[0];
+    if (!f) return;
+    try {
+      st.img = await fileToBgData(f);
+      err.textContent = '';
+      refresh(); paint();
+    } catch (e) {
+      err.textContent = '图片读取失败:' + e.message;
+    }
+  };
+  urlEl.onchange = () => {
+    const v = (urlEl.value || '').trim();
+    if (v) { st.img = v; refresh(); paint(); }
+  };
+  card.querySelector('[data-role="ok"]').onclick = () => {
+    if (st.img) {
+      if (!saveBg(st)) { err.textContent = '保存失败:图片过大,请换小图或使用网址'; return; }
+      applyBg(st);
+      hideModal();
+      toast('已应用背景与气泡透明度');
+    } else {
+      saveBg(null);
+      applyBg(null);
+      hideModal();
+      toast('已清除背景(气泡恢复不透明)');
+    }
+  };
+  card.querySelector('[data-role="clear"]').onclick = () => {
+    st.img = '';
+    refresh(); paint();
+  };
+  card.querySelector('[data-role="cancel"]').onclick = () => {
+    applyBg(saved); // 还原为已保存状态,预览不残留
+    hideModal();
+  };
+  refresh(); paint();
+  showModal(card);
+}
+
 function shellHtml() {
   return `
     <div class="view view-list active" data-view="list">
@@ -959,7 +1211,7 @@ function shellHtml() {
         <span class="title" data-role="list-title">会话</span>
         <button class="iconbtn" data-act="new-session" title="新会话">${icon('plus')}</button>
         <button class="iconbtn" data-act="workspaces" title="工作区">${icon('folder')}</button>
-        <button class="iconbtn" data-act="logout" title="退出登录">${icon('logout')}</button>
+        <button class="iconbtn" data-act="bg" title="自定义背景">${icon('image')}</button>
       </div>
       <div class="list-scroll" data-role="list-body"></div>
     </div>
@@ -971,6 +1223,7 @@ function shellHtml() {
         <button class="iconbtn" data-act="fullscreen" title="全屏/退出全屏">${icon('fullscreen')}</button>
         <button class="iconbtn" data-act="chat-menu" title="菜单">${icon('menu')}</button>
       </div>
+      <div class="compact-bar hidden" data-role="compact-bar"><span class="load-hint"><span data-role="compact-text">正在压缩上下文…</span></span></div>
       <div class="chat-scroll" data-role="chat-body"></div>
       <button class="fab" data-act="goto-bottom" title="回到底部">${icon('down')}</button>
       <div class="composer">
@@ -1029,7 +1282,9 @@ function groupedSessions() {
 function renderList() {
   const body = document.querySelector('[data-role="list-body"]');
   if (!body) return;
+  const ptr = ensurePtrEl(body); // 下拉刷新指示器(重绘后保持在列表最前)
   body.replaceChildren();
+  if (ptr) body.appendChild(ptr);
   const groups = groupedSessions();
   if (!groups.length) {
     body.appendChild(el('div', 'placeholder', '暂无会话,点右上角加号新建。'));
@@ -1067,9 +1322,14 @@ function refreshTitles() {
 
 // ── 打开/关闭会话(带子代理导航栈) ────────────────────────────────
 
-async function openSession(sessionId) {
+async function openSession(sessionId, quiet) {
   if (state.session !== sessionId) state.navStack.push(sessionId);
   state.session = sessionId;
+  // 进入会话时在浏览器/ArkWeb 历史中留一条记录:返回键/侧滑可逐级后退到列表
+  if (!quiet) {
+    histStack.push({ v: 'chat', sid: sessionId });
+    try { history.pushState({ v: 'chat', sid: sessionId }, ''); } catch (e) { /* ignore */ }
+  }
   stickBottom = true; // 进入会话总是从最新(底部)开始
   document.querySelector('[data-view="list"]').classList.remove('active');
   document.querySelector('[data-view="chat"]').classList.add('active');
@@ -1234,19 +1494,111 @@ async function deleteSessionNow(sessionId) {
   }
 }
 
+/** 重命名会话(session.rename,与电脑版一致)。 */
+function renameSession() {
+  const sid = state.session;
+  if (!sid) return;
+  const s = state.sessions.find((x) => x.sessionId === sid);
+  const card = el('div', 'login-card', `
+    <h1>重命名会话</h1>
+    <p>新标题会显示在会话列表与顶部。</p>
+    <input type="text" data-role="name" value="${esc(sessionTitleOf(s))}" />
+    <div class="error"></div>
+    <button class="btn" type="button" data-role="ok">保存</button>
+    <button class="btn btn-ghost" type="button" data-role="cancel">取消</button>`);
+  const inp = card.querySelector('[data-role="name"]');
+  const err = card.querySelector('.error');
+  const okBtn = card.querySelector('[data-role="ok"]');
+  card.querySelector('[data-role="cancel"]').onclick = hideModal;
+  const submit = async () => {
+    const t = (inp.value || '').trim();
+    if (!t) { err.textContent = '标题不能为空'; return; }
+    okBtn.disabled = true; okBtn.textContent = '保存中…';
+    try {
+      await rpc('session.rename', { sessionId: sid, title: t });
+      hideModal();
+      await loadSessions();
+      refreshTitles();
+      renderList();
+      toast('已重命名');
+    } catch (e) {
+      err.textContent = e.message;
+      okBtn.disabled = false; okBtn.textContent = '保存';
+    }
+  };
+  okBtn.onclick = submit;
+  inp.onkeydown = (e) => { if (e.key === 'Enter') submit(); };
+  showModal(card);
+  setTimeout(() => { inp.focus(); inp.select(); }, 50);
+}
+
+/** 触发上下文压缩(等效电脑版在输入框输入 /compact)。 */
+async function compactNow() {
+  const sid = state.session;
+  if (!sid) return;
+  const st = compactState(sid);
+  st.running = true; st.done = false; st.summarized = false; st.reloaded = false; st.toasted = false;
+  if (!st.startedAt) st.startedAt = Date.now();
+  compactTimeout(sid);  // 超时兜底:6 分钟未完成自动隐藏并提示
+  updateCompactBar();   // 立即显示顶栏下方的进度条
+  rerenderChat();       // 重绘消息区(同时会同步进度条状态)
+  try {
+    await rpc('commands/execute', { args: { agentId: sid, line: '/compact', images: [] } });
+    toast('已触发压缩,顶部会出现进度提示,完成后自动显示“上下文已压缩”标记');
+  } catch (e) {
+    st.running = false;
+    rerenderChat();
+    toast('压缩失败:' + e.message);
+  }
+}
+
+/** 长按某条消息 → “从此分叉”(session.fork,atSeq=该消息 seq)。 */
+function forkFrom(seq) {
+  const sid = state.session;
+  if (!sid || !Number.isFinite(seq)) return;
+  const box = el('div', 'menu');
+  box.appendChild(el('div', 'menu-title', '分叉会话'));
+  box.appendChild(el('div', 'menu-hint', '从此消息处开一个新会话分支继续对话,原会话保持不变。'));
+  const go = el('div', 'menu-item accent', '分叉为新会话');
+  go.onclick = async () => {
+    hideModal();
+    try {
+      const { sessionId } = await rpc('session.fork', { sessionId: sid, atSeq: seq });
+      await loadSessions();
+      await loadWorkspaces();
+      renderList();
+      await openSession(sessionId);
+      toast('已分叉,可直接输入继续');
+    } catch (e) {
+      toast('分叉失败:' + e.message);
+    }
+  };
+  box.appendChild(go);
+  const cl = el('div', 'menu-item', '取消');
+  cl.onclick = hideModal;
+  box.appendChild(cl);
+  showModal(box);
+}
+
 function chatMenu() {
   if (!state.session) return;
   const box = el('div', 'menu');
   box.appendChild(el('div', 'menu-title', '会话操作'));
   const s = state.sessions.find((x) => x.sessionId === state.session);
   box.appendChild(el('div', 'menu-item', `当前:${esc(sessionTitleOf(s))}<span class="m-sub">${isSubagentSession(s) ? '子代理会话' : '主会话'}</span>`));
+  const ren = el('div', 'menu-item', '重命名会话');
+  ren.onclick = () => { hideModal(); renameSession(); };
+  box.appendChild(ren);
+  const cmp = el('div', 'menu-item', '压缩上下文(等效 /compact)');
+  cmp.onclick = () => { hideModal(); compactNow(); };
+  box.appendChild(cmp);
   const del = el('div', 'menu-item accent', '删除会话记录(不可恢复)');
   del.onclick = () => { hideModal(); confirmDelete(); };
   box.appendChild(del);
   const arc = el('div', 'menu-item', '归档此会话(仅隐藏,数据保留)');
   arc.onclick = () => { hideModal(); confirmArchive(); };
   box.appendChild(arc);
-  box.appendChild(el('div', 'menu-hint', '删除 = 物理删除聊天记录日志,需电脑端已安装 dsh-session-delete 插件;运行中的任务会被拒绝。'));
+  box.appendChild(el('div', 'menu-hint', '长按任意消息 = 分叉会话;删除 = 物理删除,需电脑端 dsh-session-delete 插件;运行中的任务会被拒绝。'));
   showModal(box);
 }
 
@@ -1361,6 +1713,7 @@ function sanitizeTextPart(p) {
 function renderChatItem(it, sessionId, knownIds) {
   if (it.kind === 'msg') {
     const wrap = el('div', `msg ${it.role}`);
+    if (it.seq) wrap.dataset.seq = String(it.seq); // 供“长按分叉”定位
     const bubble = el('div', 'bubble');
     const parts = it.role === 'user' ? it.parts.map(sanitizeTextPart) : it.parts;
     bubble.innerHTML = partsHtml(parts, knownIds, sessionId, it.id);
@@ -1413,6 +1766,7 @@ function rerenderChat() {
   const flow = state.flow.get(sid) || [];
   const knownIds = knownToolCallIds(sid);
   body.replaceChildren();
+  updateCompactBar(); // 压缩进度条:固定在顶栏下方,不随消息滚动(旧实现放在滚动区顶部,长会话里根本看不到)
   for (const it of flow) {
     const node = renderChatItem(it, sid, knownIds);
     if (node) body.appendChild(node);
@@ -1550,6 +1904,295 @@ function hideModal() {
   document.querySelector('[data-role="modal"]').classList.add('hidden');
 }
 
+// ── 审批/选项卡片(投递到手机并回传) ─────────────────────────────────
+// 电脑端 GUI 的“授权请求”与“提问卡片”会作为 mux 帧推送过来
+// (approval/requested、question/requested,均为带 rpcId 的 server-request);
+// 手机端应答 = POST /api/respond 发 client-response 并回显同一 rpcId,
+// 与电脑端共享同一 pending 表:先答先生效,另一端的卡片随后自动消失。
+const pendingApprovals = new Map(); // approvalId -> {rpcId, sessionId, approvalId, toolName, reason}
+const pendingQuestions = new Map(); // rpcId -> {rpcId, sessionId, questions, sel}
+
+function decisionTitleOf(sid) {
+  const rows = state.sessions || [];
+  const row = rows.find((x) => x.sessionId === sid);
+  const t = row ? sessionTitleOf(row) : '';
+  return t ? String(t) : ('会话 ' + String(sid).slice(0, 8));
+}
+
+/** 提交 client-response 到 /api/respond,返回 RpcReceipt。 */
+async function respondMessage(message) {
+  const res = await fetch('/api/respond', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify(message),
+  });
+  let receipt = null;
+  try { receipt = await res.json(); } catch { /* 非 JSON 忽略 */ }
+  return receipt;
+}
+
+function onApprovalRequested(rpcId, p) {
+  if (pendingApprovals.has(p.approvalId)) return; // 重连重放等:幂等
+  pendingApprovals.set(p.approvalId, {
+    rpcId: rpcId,
+    sessionId: p.sessionId,
+    approvalId: p.approvalId,
+    toolName: p.toolName || 'tool',
+    reason: p.reason || '',
+  });
+  showDecisionCards('收到审批请求');
+}
+
+function onApprovalResolved(p) {
+  const had = pendingApprovals.delete(p.approvalId);
+  const label = { 'allowed-once': '已允许', rejected: '已拒绝', cancelled: '已取消', unavailable: '无应答者,已自动拒绝' }[p.outcome];
+  if (had) showDecisionCards();
+  if (label) toast('审批:' + label);
+}
+
+function onQuestionRequested(rpcId, p) {
+  if (!rpcId || pendingQuestions.has(rpcId)) return; // 幂等
+  const sel = new Map();
+  for (const q of (p.questions || [])) sel.set(q.id, { chosen: new Set(), custom: '' });
+  pendingQuestions.set(rpcId, { rpcId: rpcId, sessionId: p.sessionId, questions: p.questions || [], sel: sel });
+  showDecisionCards('收到助手提问');
+}
+
+function onQuestionResolved(p) {
+  if (pendingQuestions.delete(p.questionRpcId)) showDecisionCards();
+  toast(p.outcome === 'answered' ? '提问已处理' : '提问已取消');
+}
+
+/** 汇总渲染当前所有待处理卡片;有真实变更(from 非空)时 toast 提示。 */
+function showDecisionCards(from) {
+  const total = pendingApprovals.size + pendingQuestions.size;
+  if (from && total > 0) toast(`${from}(共 ${total} 项待处理)`);
+  const modal = document.querySelector('[data-role="modal"]');
+  if (!modal) return;
+  if (total === 0) {
+    if (!modal.classList.contains('hidden') && modal.firstElementChild &&
+        modal.firstElementChild.classList.contains('decision-card')) {
+      modal.classList.add('hidden');
+    }
+    return;
+  }
+  modal.replaceChildren(buildDecisionCards());
+  modal.classList.remove('hidden');
+}
+
+function buildDecisionCards() {
+  const card = el('div', 'menu decision-card');
+  const approvals = [...pendingApprovals.values()];
+  const questions = [...pendingQuestions.values()];
+
+  if (approvals.length) {
+    card.appendChild(el('div', 'dec-sec',
+      `<span class="dec-ic">${icon('shield')}</span>需要授权(${approvals.length})` +
+      `<span class="m-sub">${esc('允许仅针对这一次操作')}</span>`));
+    for (const a of approvals) card.appendChild(approvalItemNode(a));
+  }
+  if (questions.length) {
+    card.appendChild(el('div', 'dec-sec',
+      `<span class="dec-ic">${icon('ask')}</span>助手提问(${questions.length})`));
+    for (const en of questions) card.appendChild(questionItemNode(en));
+  }
+
+  const foot = el('div', 'dec-foot');
+  const wait = el('button', 'btn-ghost dec-wait', '收起(稍后在电脑上处理也行)');
+  wait.type = 'button';
+  wait.onclick = hideModal;
+  foot.appendChild(wait);
+  card.appendChild(foot);
+  return card;
+}
+
+function approvalItemNode(a) {
+  const box = el('div', 'dec-item');
+  box.appendChild(el('div', 'dec-who', esc('会话:' + decisionTitleOf(a.sessionId))));
+  box.appendChild(el('div', 'dec-tool', esc(a.toolName)));
+  if (a.reason) box.appendChild(el('div', 'dec-reason', esc(a.reason)));
+  const btns = el('div', 'dec-btns');
+  const allow = el('button', 'btn', '允许一次');
+  allow.type = 'button';
+  allow.onclick = () => answerApproval(a, 'allowed-once');
+  const deny = el('button', 'btn ghost-danger', '拒绝');
+  deny.type = 'button';
+  deny.onclick = () => answerApproval(a, 'rejected');
+  btns.appendChild(allow);
+  btns.appendChild(deny);
+  box.appendChild(btns);
+  return box;
+}
+
+async function answerApproval(a, outcome) {
+  try {
+    const receipt = await respondMessage({
+      type: 'client-response',
+      rpcId: a.rpcId,
+      result: { ok: true, value: { sessionId: a.sessionId, approvalId: a.approvalId, outcome: outcome } },
+    });
+    pendingApprovals.delete(a.approvalId);
+    if (receipt && receipt.accepted === true) {
+      toast(outcome === 'allowed-once' ? '已允许该操作' : '已拒绝该操作');
+    } else {
+      const why = receipt && receipt.reason ? receipt.reason : '未知';
+      toast(why === 'not-pending' ? '该请求已在别处处理' : '应答未生效:' + why);
+    }
+  } catch (e) {
+    toast('提交失败:' + e.message);
+  }
+  showDecisionCards();
+}
+
+function questionItemNode(en) {
+  const box = el('div', 'dec-item');
+  box.appendChild(el('div', 'dec-who', esc('会话:' + decisionTitleOf(en.sessionId))));
+  const qs = en.questions;
+  for (let i = 0; i < qs.length; i++) {
+    const q = qs[i];
+    const st = en.sel.get(q.id) || { chosen: new Set(), custom: '' };
+    const blk = el('div', 'q-block');
+    if (q.header) blk.appendChild(el('div', 'q-head', esc(q.header)));
+    blk.appendChild(el('div', 'q-txt', esc((qs.length > 1 ? `${i + 1}. ` : '') + q.question)));
+    if (q.detail) blk.appendChild(el('div', 'q-detail', esc(q.detail)));
+    const opts = q.options || [];
+    const multi = q.multiSelect === true;
+    if (opts.length === 0) {
+      const ta = el('textarea', 'q-text', '');
+      ta.placeholder = '输入回答…';
+      ta.value = st.custom;
+      ta.addEventListener('input', () => { st.custom = ta.value; });
+      blk.appendChild(ta);
+    } else {
+      const wrap = el('div', 'q-opts');
+      for (const opt of opts) {
+        const selOn = st.chosen.has(opt.label);
+        const row = el('div', 'q-opt' + (selOn ? ' sel' : ''));
+        row.appendChild(el('span', multi ? 'q-box' : 'q-dot', ''));
+        const lab = el('div', 'q-lbl');
+        lab.appendChild(el('div', 'q-label', esc(opt.label)));
+        if (opt.description) lab.appendChild(el('div', 'q-desc', esc(opt.description)));
+        row.appendChild(lab);
+        row.onclick = () => {
+          if (multi) {
+            if (st.chosen.has(opt.label)) st.chosen.delete(opt.label);
+            else st.chosen.add(opt.label);
+          } else {
+            // 单选:点选项时清空已填的自定义文本(宿主校验:单选不能两者同时给)
+            if ((st.custom || '').trim() !== '') {
+              st.custom = '';
+              const inp = blk.querySelector('.q-custom-in');
+              if (inp) inp.value = '';
+            }
+            st.chosen.clear();
+            st.chosen.add(opt.label);
+          }
+          showDecisionCards(); // 重绘卡片反映选中态
+        };
+        wrap.appendChild(row);
+      }
+      blk.appendChild(wrap);
+      // 自定义回答:不想选固定选项时可直接输入;单选填自定义会自动取消选项,
+      // 多选则允许“选若干项 + 自定义补充”并存
+      const cu = el('textarea', 'q-text q-custom-in', '');
+      cu.placeholder = '自定义回答(不想选上面选项时直接输入)…';
+      cu.value = st.custom;
+      cu.addEventListener('input', () => {
+        st.custom = cu.value;
+        if (!multi && st.chosen.size > 0) {
+          st.chosen.clear();
+          for (const r of blk.querySelectorAll('.q-opt.sel')) r.classList.remove('sel');
+        }
+      });
+      blk.appendChild(cu);
+    }
+    box.appendChild(blk);
+  }
+  const ok = el('button', 'btn', '提交回答');
+  ok.type = 'button';
+  ok.style.marginTop = '10px';
+  ok.onclick = () => submitQuestions(en);
+  box.appendChild(ok);
+  return box;
+}
+
+function questionsReady(en) {
+  return en.questions.every((q) => {
+    const st = en.sel.get(q.id);
+    if (!st) return false;
+    return st.chosen.size > 0 || (st.custom || '').trim() !== '';
+  });
+}
+
+async function submitQuestions(en) {
+  if (!questionsReady(en)) { toast('请先回答每个问题'); return; }
+  const answers = en.questions.map((q) => {
+    const st = en.sel.get(q.id) || { chosen: new Set(), custom: '' };
+    const item = { id: q.id, selected: [...st.chosen] };
+    const c = (st.custom || '').trim();
+    if (c) item.custom = c;
+    return item;
+  });
+  try {
+    const receipt = await respondMessage({
+      type: 'client-response',
+      rpcId: en.rpcId,
+      result: { ok: true, value: { sessionId: en.sessionId, answer: { answers: answers } } },
+    });
+    pendingQuestions.delete(en.rpcId);
+    if (receipt && receipt.accepted === true) toast('回答已提交');
+    else {
+      const why = receipt && receipt.reason ? receipt.reason : '未知';
+      toast(why === 'not-pending' ? '该提问已在别处处理' : '提交未生效:' + why);
+    }
+  } catch (e) {
+    toast('提交失败:' + e.message);
+  }
+  showDecisionCards();
+}
+
+// ── 原生返回桥接(HarmonyOS ArkWeb)+ 浏览器历史导航 ────────────────
+// 进入会话时 pushState 留痕(histStack 与浏览器历史同步),使返回键/侧滑能
+// 逐级后退:子代理会话 → 父会话 → 会话列表 → 才退出本页(回连接设置页)。
+// goWebBack 是统一“返回”入口(网页顶部返回按钮与 __dshMobileBack 共用):
+//   1. 有弹窗 → 先关弹窗;
+//   2. 在聊天页且有历史记录 → history.back(),由 popstate 驱动界面回退;
+//   3. 在聊天页但无历史(旧入口/刷新后)→ 网页内部返回(父会话/列表);
+//   4. 已在列表根部 → false,由鸿蒙壳退出页面。
+const histStack = [];
+
+function goWebBack() {
+  try {
+    const modal = document.querySelector('[data-role="modal"]');
+    if (modal && !modal.classList.contains('hidden')) { hideModal(); return true; }
+    const chat = document.querySelector('[data-view="chat"]');
+    if (!chat || !chat.classList.contains('active')) return false; // 已不在聊天页
+    if (histStack.length > 0) {
+      try { history.back(); } catch (e) { backFromChat(); }
+      return true;
+    }
+    backFromChat();
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+if (typeof window !== 'undefined') {
+  window.__dshMobileBack = goWebBack;
+
+  window.addEventListener('popstate', () => {
+    const s = history.state;
+    if (s && s.v === 'chat' && typeof s.sid === 'string') {
+      if (histStack.length > 0) histStack.pop();
+      openSession(s.sid, true); // quiet:由浏览器历史驱动,不再 pushState
+    } else {
+      histStack.length = 0;
+      backToList();
+    }
+  });
+}
+
 // ── 启动 ────────────────────────────────────────────────────────────
 
 async function toggleFullscreen() {
@@ -1565,10 +2208,75 @@ async function toggleFullscreen() {
   }
 }
 
+// ── 会话列表下拉刷新 ────────────────────────────────────────────────
+let ptrEl = null;
+const ptrPull = { y: null, dist: 0, busy: false };
+const PTR_OK = 56; // 达到该下拉距离触发刷新
+
+function ensurePtrEl(body) {
+  if (!ptrEl || !ptrEl.isConnected) {
+    ptrEl = el('div', 'ptr');
+    ptrEl.appendChild(el('span', 'ptr-txt', '下拉刷新'));
+    if (body) body.appendChild(ptrEl);
+  }
+  return ptrEl;
+}
+
+function setPtrState(dist, text, spin) {
+  if (!ptrEl) return;
+  ptrEl.style.height = (dist > 0 ? dist : 0) + 'px';
+  const t = ptrEl.querySelector('.ptr-txt');
+  if (t) { t.textContent = text; }
+  ptrEl.classList.toggle('spin', !!spin);
+}
+
+function bindPullRefresh() {
+  const sc = document.querySelector('[data-role="list-body"]');
+  if (!sc) return;
+  ensurePtrEl(sc);
+  sc.addEventListener('touchstart', (e) => {
+    ptrPull.y = (ptrPull.busy || !e.touches || e.touches.length !== 1) ? null : e.touches[0].clientY;
+  }, { passive: true });
+  sc.addEventListener('touchmove', (e) => {
+    if (ptrPull.busy || ptrPull.y === null || !e.touches) return;
+    const dy = e.touches[0].clientY - ptrPull.y;
+    if (sc.scrollTop > 0 || dy <= 0) {
+      ptrPull.y = null; // 正常上滑/非顶部:交给原生滚动
+      if (dy <= 0) setPtrState(0, '下拉刷新', false);
+      return;
+    }
+    e.preventDefault(); // 顶部下拉:接管手势,阻止橡皮筋/原生滚动
+    ptrPull.dist = Math.min(110, dy * 0.5);
+    setPtrState(ptrPull.dist, ptrPull.dist >= PTR_OK ? '松开立即刷新' : '下拉刷新', false);
+  }, { passive: false });
+  const endPull = async () => {
+    if (ptrPull.busy || ptrPull.y === null) return;
+    ptrPull.y = null;
+    const go = ptrPull.dist >= PTR_OK;
+    ptrPull.dist = 0;
+    if (go) {
+      ptrPull.busy = true;
+      setPtrState(46, '正在刷新…', true);
+      try {
+        await Promise.all([loadSessions(), loadWorkspaces()]);
+        renderList();
+        toast('会话列表已刷新');
+      } catch (err) {
+        toast('刷新失败,请检查网络');
+      }
+      ptrPull.busy = false;
+    }
+    setPtrState(0, '下拉刷新', false);
+  };
+  sc.addEventListener('touchend', endPull);
+  sc.addEventListener('touchcancel', endPull);
+}
+
 function bindShell() {
   document.querySelector('[data-act="new-session"]').onclick = newSession;
   document.querySelector('[data-act="workspaces"]').onclick = workspaceMenu;
-  document.querySelector('[data-act="back"]').onclick = backFromChat;
+  document.querySelector('[data-act="bg"]').onclick = bgMenu;
+  document.querySelector('[data-act="back"]').onclick = goWebBack;
   document.querySelector('[data-act="send"]').onclick = sendPrompt;
   document.querySelector('[data-act="cancel"]').onclick = cancelRun;
   document.querySelector('[data-act="chat-menu"]').onclick = chatMenu;
@@ -1588,13 +2296,10 @@ function bindShell() {
       sendPrompt();
     }
   };
-  document.querySelector('[data-act="logout"]').onclick = async () => {
-    await doLogout();
-    location.reload();
-  };
   document.querySelector('[data-role="modal"]').onclick = (e) => {
     if (e.target === e.currentTarget) hideModal();
   };
+  bindPullRefresh(); // 会话列表下拉刷新
 
   // 聊天滚动容器:跟踪贴底意图 + 一键到底悬浮按钮显隐
   const chatBody = document.querySelector('[data-role="chat-body"]');
@@ -1635,6 +2340,35 @@ function bindShell() {
     const childHead = e.target.closest('.child-head');
     if (childHead) { childHead.closest('.child-section').classList.toggle('closed'); }
   });
+
+  // 长按任意消息 → 分叉会话(与电脑版"从此消息分叉"一致)
+  let lpTimer = null;
+  let lpPos = null;
+  const lpCancel = () => {
+    if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; }
+    lpPos = null;
+  };
+  chatBody.addEventListener('pointerdown', (e) => {
+    lpCancel();
+    if (!state.session) return;
+    if (e.target.closest('button, a, textarea, input')) return;
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    const wrap = e.target.closest('.msg');
+    if (!wrap) return;
+    const seq = Number(wrap.dataset.seq);
+    if (!Number.isFinite(seq) || seq <= 0) return;
+    lpPos = [e.clientX, e.clientY];
+    lpTimer = setTimeout(() => {
+      lpTimer = null;
+      lpPos = null;
+      forkFrom(seq);
+    }, 520);
+  });
+  chatBody.addEventListener('pointermove', (e) => {
+    if (lpTimer && lpPos && (Math.abs(e.clientX - lpPos[0]) > 12 || Math.abs(e.clientY - lpPos[1]) > 12)) lpCancel();
+  });
+  chatBody.addEventListener('pointerup', lpCancel);
+  chatBody.addEventListener('pointercancel', lpCancel);
 }
 
 async function startApp() {
@@ -1674,6 +2408,7 @@ async function startApp() {
 }
 
 (async function boot() {
+  applyBg(loadBg()); // 一进页面就套上已保存的背景
   const app = $('#app');
   const auth = await checkAuth();
   state.auth = auth;
