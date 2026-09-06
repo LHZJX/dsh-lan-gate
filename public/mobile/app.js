@@ -7,7 +7,17 @@
  *   4) 工具调用/思考过程默认收起(点击展开),默认只呈现用户与主 agent 文本;
  *   5) 对话文本支持 Markdown(标题/列表/表格/引用/行内样式),代码块保留;
  *   6) 顶部字符按钮全部换成 SVG 图标;“■ 停止”仅在有任务运行/流式输出时显示;
- *      原黑色方块按钮即为“停止”(session.cancel),未运行时不显示。
+ *      原黑色方块按钮即为“停止”(session.cancel),未运行时不显示;
+ *   7) 历史记录向前分页:向上滚到顶部自动加载更早记录,可一直翻到最早的对话
+ *      (session.history 按消息边界分页,beforeSeq=当前最老 seq,hasMore 驱动);
+ *   8) 上下文压缩(compaction):被压缩遮蔽的旧内容不展示,checkpoint 的摘要正文
+ *      也不展示,只在原位置显示“上下文已压缩”标记;
+ *   9) 用户消息正文里被发送端拼入的“运行上下文快照”(Current runtime context /
+ *      Current DSH file policy / Approval policy 段)仅展示层过滤,不显示在对话中;
+ *   10) 流式思考期间:思考块手动收起/展开状态跨重渲染记忆;自动贴底仅在用户
+ *      几乎停在底部时跟随,上滑即停,不再被新内容拽回;
+ *   11) 流式增量输出改就地更新(live 气泡不重建):思考框内可正常上下滑动,
+ *      展开/收起与框内滚动位置在输出过程中保持不被打断。
  *
  * v3 新增:
  *   1) 会话列表按工作区分组(未分组会话放“其他会话”);
@@ -63,11 +73,12 @@ function pathBase(p) {
 
 // ── 传输层 ──────────────────────────────────────────────────────────
 
-async function httpJson(url, body) {
+async function httpJson(url, body, opts) {
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json', accept: 'application/json' },
     body: JSON.stringify(body),
+    signal: opts && opts.signal,
   });
   const text = await res.text();
   let parsed = null;
@@ -81,9 +92,9 @@ async function httpJson(url, body) {
   return parsed;
 }
 
-async function rpc(method, payload = {}) {
+async function rpc(method, payload = {}, opts) {
   const rpcId = uuid();
-  const response = await httpJson('/api/' + method, { type: 'client-request', rpcId, method, payload });
+  const response = await httpJson('/api/' + method, { type: 'client-request', rpcId, method, payload }, opts);
   if (!response || response.type !== 'server-response' || response.rpcId !== rpcId) {
     throw new Error('传输失败:应答不匹配');
   }
@@ -179,24 +190,61 @@ async function loadWorkspaces() {
   state.archivedIds = new Set(archivedSessionIds || []);
 }
 
-async function loadHistory(sessionId) {
-  const { events } = await rpc('session.history', { sessionId, maxMessages: 50 });
-  const flow = ensureFlow(sessionId);
-  flow.length = 0;
+/** 折叠一页历史事件为 flow 项。压缩语义:
+ *   - 事件带 surfaceOp replace(压缩 checkpoint)→ 该区间内的旧内容被遮蔽,不展示;
+ *   - source 标记为 compact 插件的 checkpoint 消息内容(摘要框架)不展示,
+ *     只在原位置放一个“上下文已压缩”标记。返回 { items, leftovers, minSeq }。 */
+function foldHistoryEvents(events, sessionId) {
+  const items = [];
   const chunkAcc = new Map();
   const committed = new Set();
-  let maxSeq = -1;
+  let minSeq = Infinity;
+
+  // 第一遍:收集本页声明的 replace 遮蔽区间 + 压缩摘要信息(compaction/summary 先于 checkpoint 落页)
+  const newRanges = [];
+  const summaries = new Map();
+  for (const { event } of events || []) {
+    if (!event) continue;
+    const d = event.data || {};
+    if (event.type === 'compaction/summary' && d.compactionId) {
+      summaries.set(d.compactionId, {
+        tokens: typeof d.shadowedTokenCount === 'number' ? d.shadowedTokenCount : null,
+        items: Array.isArray(d.shadowedSeqs) ? fmtItems(d.shadowedSeqs.length) : null,
+      });
+    }
+    const so = event.surfaceOp;
+    if (so && so.op === 'replace' && typeof so.start === 'number' && typeof so.end === 'number') {
+      newRanges.push({ start: so.start, end: so.end });
+    }
+  }
+  const known = sessionId ? shadowRanges.get(sessionId) || [] : [];
+  const ranges = known.concat(newRanges);
+  const isSh = (seq) => inShadow(seq, ranges);
 
   for (const { event } of events || []) {
     if (!event) continue;
-    if (typeof event.seq === 'number' && event.seq > maxSeq) maxSeq = event.seq;
-    const type = event.type;
     const data = event.data || {};
+    const type = event.type;
+    if (typeof event.seq === 'number' && event.seq < minSeq) minSeq = event.seq;
     if (type === 'user/message' || type === 'assistant/message') {
+      const key = `${data.turn}:${data.step}`;
       const rawMsg = data.message || data;
+      if (isSh(event.seq)) { committed.add(key); continue; } // 被压缩遮蔽的旧消息
+      const cid = compactOf(rawMsg);
+      if (cid) {
+        // 压缩 checkpoint:不渲染摘要内容,只放标记
+        const info = summaries.get(cid);
+        const fallbackShadowed = Array.isArray(event.sourceEventSeqs) ? fmtItems(Math.max(0, event.sourceEventSeqs.length - 2)) : null;
+        items.push({
+          kind: 'compact', id: 'cmp-' + (rawMsg.id || event.seq), seq: event.seq, compactionId: cid,
+          tokens: info && info.tokens, shadowed: (info && info.items) || fallbackShadowed,
+        });
+        continue;
+      }
       const msg = normalizeMessage(rawMsg);
-      if (msg) { flow.push(msg); committed.add(`${data.turn}:${data.step}`); }
+      if (msg) { msg.key = key; msg.seq = event.seq; items.push(msg); committed.add(key); }
     } else if (type === 'assistant/chunk') {
+      if (isSh(event.seq)) continue;
       const key = `${data.turn}:${data.step}`;
       let acc = chunkAcc.get(key);
       if (!acc) { acc = { text: '', reasoning: '' }; chunkAcc.set(key, acc); }
@@ -204,10 +252,12 @@ async function loadHistory(sessionId) {
       if (ch.type === 'text-delta') acc.text += ch.text || '';
       else if (ch.type === 'reasoning-delta') acc.reasoning += ch.text || '';
     } else if (type === 'tool/call') {
-      flow.push({ kind: 'tool', id: 'tool-' + data.callId, callId: data.callId, name: data.name || 'tool', argsRaw: data.arguments || '', state: 'running', startedAt: event.time });
+      if (isSh(event.seq)) continue;
+      items.push({ kind: 'tool', id: 'tool-' + data.callId, callId: data.callId, name: data.name || 'tool', argsRaw: data.arguments || '', state: 'running', startedAt: event.time, seq: event.seq });
     } else if (type === 'tool/result') {
+      if (isSh(event.seq)) continue;
       const callId = toolResultCallId(data);
-      const item = flow.find((x) => x.kind === 'tool' && x.callId === callId);
+      const item = items.find((x) => x.kind === 'tool' && x.callId === callId);
       if (item) {
         const err = !!(data.error || isErrorResult(data));
         item.state = err ? 'error' : 'ok';
@@ -216,16 +266,107 @@ async function loadHistory(sessionId) {
         item.errorMsg = data.error && (data.error.message || data.error.code);
       }
     } else if (type === 'turn/end' && data.reason && data.reason.kind === 'error') {
-      flow.push({ kind: 'error', id: 'err-' + event.seq, message: (data.reason.error && data.reason.error.message) || '回合出错' });
+      if (isSh(event.seq)) continue;
+      items.push({ kind: 'error', id: 'err-' + event.seq, message: (data.reason.error && data.reason.error.message) || '回合出错', seq: event.seq });
     }
+    // compaction/start|summary|end|prune 等:仅上面收集信息,不单独渲染
   }
+  const leftovers = [];
   for (const [key, acc] of chunkAcc) {
     if (!committed.has(key) && (acc.text || acc.reasoning)) {
-      flow.push({ kind: 'live', id: 'live-' + key, key, text: acc.text, reasoning: acc.reasoning, createdAt: Date.now() });
+      leftovers.push({ kind: 'live', id: 'live-' + key, key, text: acc.text, reasoning: acc.reasoning, createdAt: Date.now() });
     }
   }
+  if (sessionId) mergeShadowRanges(sessionId, newRanges);
+  return { items, leftovers, minSeq };
+}
+
+async function loadHistory(sessionId) {
+  const { events, hasMore } = await rpc('session.history', { sessionId, maxMessages: 50 });
+  const flow = ensureFlow(sessionId);
+  flow.length = 0;
+  const { items, leftovers, minSeq } = foldHistoryEvents(events, sessionId);
+  for (const it of items) flow.push(it);
+  for (const it of leftovers) flow.push(it);
+  let maxSeq = -1;
+  for (const { event } of events || []) {
+    if (event && typeof event.seq === 'number' && event.seq > maxSeq) maxSeq = event.seq;
+  }
   state.seqBySession.set(sessionId, maxSeq);
+  flowFloors.set(sessionId, { min: Number.isFinite(minSeq) ? minSeq : null, hasMore: !!hasMore });
   if (state.session === sessionId) rerenderChat();
+}
+
+let loadingMore = false;
+
+/** 向前加载更早记录。若某整页全是被压缩遮蔽(无可渲染项)的内容,自动连续向前翻,
+ *  直到出现可见内容或翻到最早,避免“卡在遮蔽段”永远到不了顶。 */
+async function loadOlder(sessionId) {
+  if (loadingMore || !sessionId) return;
+  const body = document.querySelector('[data-role="chat-body"]');
+  const inView = state.session === sessionId && !!body;
+  loadingMore = true;
+  let mark = null;
+  if (inView) {
+    mark = el('div', 'msg load-more', '<span class="load-hint">加载更早记录…</span>');
+    body.insertBefore(mark, body.firstChild);
+  }
+  try {
+    let pre = [];
+    for (let guard = 0; guard < 60; guard++) {
+      const floor = flowFloors.get(sessionId);
+      if (!floor || !floor.min || !floor.hasMore) break; // 已到最早
+      // 单次请求 30s 超时,避免网络卡死时 loadingMore 永远占位
+      const ctrl = typeof AbortController === 'undefined' ? null : new AbortController();
+      const timer = ctrl ? setTimeout(() => ctrl.abort(), 30000) : null;
+      let page;
+      try {
+        page = await rpc('session.history', { sessionId, beforeSeq: floor.min, maxMessages: 50 }, ctrl);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+      const events = (page && page.events) || [];
+      const hasMore = !!(page && page.hasMore);
+      if (!events.length) {
+        flowFloors.set(sessionId, { min: null, hasMore: false });
+        break;
+      }
+      const { items, leftovers, minSeq } = foldHistoryEvents(events, sessionId);
+      const flow = ensureFlow(sessionId);
+      const have = new Set();
+      for (const it of flow) if (it.key) have.add(it.key);
+      const pageItems = items.slice();
+      for (const it of leftovers) if (!have.has(it.key)) { pageItems.push(it); have.add(it.key); }
+      flow.splice(0, 0, ...pageItems);
+      flowFloors.set(sessionId, { min: Number.isFinite(minSeq) ? minSeq : null, hasMore: !!hasMore });
+      if (pageItems.length) { pre = pageItems; break; }
+      // 本页没有可见内容(整页为压缩遮蔽):不插入 DOM,继续向前翻
+      if (state.session !== sessionId) break; // 用户已离开该会话,停止继续空翻
+    }
+    if (inView && pre.length && state.session === sessionId) {
+      const prevTop = body.scrollTop;
+      if (mark && mark.isConnected) mark.remove();
+      const prevH = body.scrollHeight;
+      const knownIds = knownToolCallIds(sessionId);
+      const frag = document.createDocumentFragment();
+      for (const it of pre) {
+        const node = renderChatItem(it, sessionId, knownIds);
+        if (node) frag.appendChild(node);
+      }
+      body.insertBefore(frag, body.firstChild);
+      body.scrollTop = prevTop + (body.scrollHeight - prevH);
+      renderImagesAsync(sessionId, body);
+      syncChatUi(body);
+    } else if (inView && mark && mark.isConnected) {
+      mark.remove();
+      syncChatUi(body);
+    }
+  } catch {
+    if (mark && mark.isConnected) mark.remove();
+    toast('加载更早记录失败');
+  } finally {
+    loadingMore = false;
+  }
 }
 
 function toolResultCallId(data) {
@@ -261,6 +402,13 @@ function applyLiveEvent(sessionId, event) {
   const flow = ensureFlow(sessionId);
   let changed = false;
 
+  // 压缩生命周期 / checkpoint 消息:不做普通气泡处理,延迟整体重建让“已压缩”标记与遮蔽一致
+  if (type === 'compaction/start' || type === 'compaction/summary' || type === 'compaction/end' ||
+      ((type === 'user/message' || type === 'assistant/message') && compactOf(data.message || data))) {
+    scheduleCompactionReload(sessionId);
+    return changed;
+  }
+
   if (type === 'user/message' || type === 'assistant/message') {
     const rawMsg = data.message || data;
     const key = `${data.turn}:${data.step}`;
@@ -283,8 +431,12 @@ function applyLiveEvent(sessionId, event) {
       flow.push(it);
     }
     const ch = data.chunk || {};
-    if (ch.type === 'text-delta') { it.text += ch.text || ''; changed = true; }
-    else if (ch.type === 'reasoning-delta') { it.reasoning += ch.text || ''; changed = true; }
+    if (ch.type === 'text-delta') it.text += ch.text || '';
+    else if (ch.type === 'reasoning-delta') it.reasoning += ch.text || '';
+    // 增量输出:就地更新已渲染的 live 气泡(思考框/正文),避免整条重渲染打断框内滚动
+    if (sessionId === state.session && (ch.type === 'text-delta' || ch.type === 'reasoning-delta')) {
+      if (!patchLiveChat(sessionId, it)) changed = true; // 节点尚未创建,仍需整条渲染一次
+    }
   } else if (type === 'tool/call') {
     const callId = data.callId;
     if (!flow.some((x) => x.kind === 'tool' && x.callId === callId)) {
@@ -321,6 +473,55 @@ function applyLiveEvent(sessionId, event) {
   }
   if (changed && sessionId === state.session) scheduleRerender();
   return changed;
+}
+
+/** 就地增量更新流式 live 气泡:思考框/正文内容就地刷新,元素不重建,
+ *  因此思考框内部的滚动位置与手势不会被打断。返回是否定位到已渲染节点。 */
+function patchLiveChat(sessionId, it) {
+  const body = document.querySelector('[data-role="chat-body"]');
+  if (!body || state.session !== sessionId) return false;
+  let wrap = null;
+  for (const child of body.children) {
+    if (child.dataset && child.dataset.live === `${sessionId}:${it.key}`) { wrap = child; break; }
+  }
+  if (!wrap) return false;
+  const bubble = wrap.querySelector('.bubble');
+  if (!bubble) return false;
+  const typing = bubble.querySelector('.typing');
+  const thinkKey = `${sessionId}|live:${it.key}`;
+  const thinkOpenNow = thinkOverrides.has(thinkKey) ? thinkOverrides.get(thinkKey) : !it.text;
+
+  if (it.reasoning) {
+    let think = bubble.querySelector(':scope > .think');
+    if (!think) {
+      const tmp = el('div', '', thinkHtml(it.reasoning, thinkKey, !it.text));
+      think = tmp.firstElementChild;
+      bubble.insertBefore(think, typing);
+    } else {
+      think.classList.toggle('open', thinkOpenNow);
+      const tb = think.querySelector('.think-body');
+      if (tb) {
+        const wasBottom = tb.scrollTop + tb.clientHeight >= tb.scrollHeight - 12;
+        const pos = tb.scrollTop;
+        tb.innerHTML = esc(it.reasoning);
+        tb.scrollTop = wasBottom ? tb.scrollHeight : Math.min(pos, tb.scrollHeight);
+      }
+    }
+  }
+  if (it.text) {
+    let md = bubble.querySelector(':scope > .md');
+    if (!md) {
+      md = el('div', 'md', mdHtml(it.text));
+      bubble.insertBefore(md, typing);
+    } else {
+      md.innerHTML = mdHtml(it.text);
+    }
+    // 出正文后,无手动覆盖时让思考块收回去(有覆盖则保持用户选择)
+    const think2 = bubble.querySelector(':scope > .think');
+    if (think2) think2.classList.toggle('open', thinkOverrides.has(thinkKey) ? thinkOverrides.get(thinkKey) : false);
+  }
+  if (stickBottom) body.scrollTop = body.scrollHeight;
+  return true;
 }
 
 // ── 事件流 ──────────────────────────────────────────────────────────
@@ -461,6 +662,7 @@ const ICONS = {
   zap: '<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>',
   bot: '<rect x="4" y="7" width="16" height="11" rx="3"/><circle cx="9" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="15" cy="12" r="1.4" fill="currentColor" stroke="none"/><path d="M12 7V3"/><circle cx="12" cy="2.2" r="1.2" fill="currentColor" stroke="none"/>',
   warn: '<path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>',
+  fold: '<path d="M8 3v3a2 2 0 0 1-2 2H3"/><path d="M21 8h-3a2 2 0 0 1-2-2V3"/><path d="M3 16h3a2 2 0 0 1 2 2v3"/><path d="M16 21v-3a2 2 0 0 1 2-2h3"/>',
 };
 
 function icon(name) {
@@ -616,8 +818,52 @@ function mdHtml(raw) {
 // ── 折叠状态(工具卡展开集 / 工作区收起集 / 粘底标记) ──────────────
 
 const openTools = new Set(); // callId 集合:已展开的工具卡
+const thinkOverrides = new Map(); // "sessionId|itemKey" -> true/false:用户手动展开/收起思考块的记忆(重渲染不重置)
 let wsClosed = new Set(); // group key 集合:已收起的组
 let stickBottom = false; // 聊天是否应保持贴底(自动滚到最新)
+const flowFloors = new Map(); // sessionId -> { min: 已加载最早事件seq, hasMore: 是否还有更早 }
+const shadowRanges = new Map(); // sessionId -> [{start,end}]:被压缩(compaction replace)遮蔽的原始事件 seq 区间
+
+/** 压缩 checkpoint 来源:kind=plugin 且 plugin=compact(附带 compactionId)。 */
+function compactOf(rawMsg) {
+  const s = rawMsg && rawMsg.source;
+  if (s && s.kind === 'plugin' && s.plugin === 'compact' && typeof s.compactionId === 'string') return s.compactionId;
+  return null;
+}
+function inShadow(seq, ranges) {
+  if (typeof seq !== 'number') return false;
+  for (const r of ranges) if (seq >= r.start && seq <= r.end) return true;
+  return false;
+}
+function mergeShadowRanges(sessionId, ranges) {
+  if (!ranges || !ranges.length) return;
+  const all = (shadowRanges.get(sessionId) || []).concat(ranges).sort((a, b) => a.start - b.start);
+  const merged = [];
+  for (const r of all) {
+    const last = merged[merged.length - 1];
+    if (last && r.start <= last.end + 1) last.end = Math.max(last.end, r.end);
+    else merged.push({ start: r.start, end: r.end });
+  }
+  shadowRanges.set(sessionId, merged);
+}
+function fmtTokens(n) {
+  if (!Number.isFinite(n) || n < 0) return '';
+  return n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n);
+}
+function fmtItems(n) {
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/** 会话被压缩时(实时收到压缩事件),延迟合并重建一次,让“已压缩”标记尽快出现且数据一致。 */
+let compactionReload = null;
+function scheduleCompactionReload(sessionId) {
+  if (!sessionId) return;
+  if (compactionReload) clearTimeout(compactionReload);
+  compactionReload = setTimeout(() => {
+    compactionReload = null;
+    loadHistory(sessionId).catch(() => { /* ignore */ });
+  }, 400);
+}
 
 function loadWsClosed() {
   try { wsClosed = new Set(JSON.parse(localStorage.getItem(LS_WS_CLOSED) || '[]')); } catch { wsClosed = new Set(); }
@@ -630,8 +876,9 @@ function toggleWsClosed(key) {
   saveWsClosed();
 }
 
-function nearBottom(el) {
-  return el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+function nearBottom(el, gap) {
+  if (gap === undefined) gap = 160;
+  return el.scrollHeight - el.scrollTop - el.clientHeight < gap;
 }
 function scrollBottomEl(el, smooth) {
   try { el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' }); }
@@ -647,11 +894,12 @@ function el(tag, className, html) {
   return e;
 }
 
-function partsHtml(parts, knownToolCallIds) {
+function partsHtml(parts, knownToolCallIds, sid, msgId) {
   const rows = [];
+  let ti = 0;
   for (const p of parts) {
     if (p.kind === 'text') rows.push(`<div class="md">${mdHtml(p.text)}</div>`);
-    else if (p.kind === 'reasoning') rows.push(thinkHtml(p.text));
+    else if (p.kind === 'reasoning') rows.push(thinkHtml(p.text, `${sid || ''}|${msgId || 'm'}#t${ti++}`, false));
     else if (p.kind === 'code') rows.push(codeBlockHtml(p.lang, p.text));
     else if (p.kind === 'image') rows.push(`<div class="msg-image" data-attachment-id="${esc((p.attachment && p.attachment.attachmentId) || '')}">图片…</div>`);
     else if (p.kind === 'tool') {
@@ -666,8 +914,12 @@ function codeBlockHtml(lang, text) {
   return `<pre>${lang ? `<span class="pre-lang">${esc(lang)}</span>\n` : ''}${esc(text)}</pre>`;
 }
 
-function thinkHtml(text, forceOpen) {
-  return `<div class="think${forceOpen ? ' open' : ''}"><button type="button" class="think-head"><span class="think-ic">${icon('zap')}</span>` +
+/** 思考块:key 用于跨重渲染记住用户的手动展开/收起;fallbackOpen 是默认态
+ * (流式“纯思考”阶段为 true,正文出现后/历史消息为 false)。 */
+function thinkHtml(text, key, fallbackOpen) {
+  const k = key || '';
+  const open = k && thinkOverrides.has(k) ? thinkOverrides.get(k) : !!fallbackOpen;
+  return `<div class="think${open ? ' open' : ''}" data-think="${esc(k)}"><button type="button" class="think-head"><span class="think-ic">${icon('zap')}</span>` +
     `<span class="think-txt">思考过程</span><span class="think-caret">${icon('chevron')}</span></button>` +
     `<div class="think-body">${esc(text)}</div></div>`;
 }
@@ -722,7 +974,7 @@ function shellHtml() {
       <div class="chat-scroll" data-role="chat-body"></div>
       <button class="fab" data-act="goto-bottom" title="回到底部">${icon('down')}</button>
       <div class="composer">
-        <textarea data-role="composer-input" placeholder="发消息…" rows="1"></textarea>
+        <textarea data-role="composer-input" placeholder="发消息…" rows="1" enterkeyhint="newline"></textarea>
         <button class="send" data-act="send" title="发送">${icon('send')}</button>
       </div>
     </div>
@@ -822,10 +1074,17 @@ async function openSession(sessionId) {
   document.querySelector('[data-view="list"]').classList.remove('active');
   document.querySelector('[data-view="chat"]').classList.add('active');
   const input = document.querySelector('[data-role="composer-input"]');
-  if (input) input.value = '';
+  if (input) { input.value = ''; input.style.height = ''; }
   await loadHistory(sessionId);
   refreshTitles();
   rerenderChat();
+  // 若已加载内容不足一屏(几乎不滚动),自动继续向前翻页直到可滚动或到最早
+  for (let k = 0; k < 10; k++) {
+    const fl = flowFloors.get(sessionId);
+    const b = document.querySelector('[data-role="chat-body"]');
+    if (!fl || !fl.hasMore || !b || b.scrollHeight - b.clientHeight > 4) break;
+    await loadOlder(sessionId);
+  }
 }
 
 function backFromChat() {
@@ -1081,19 +1340,40 @@ function workspaceMenu() {
 
 // ── 聊天渲染 ───────────────────────────────────────────────────────
 
+/** 去掉平台注入进用户消息正文的运行上下文快照(Current runtime context / DSH file policy /
+ *  Approval policy 段)—— 这些不是用户真实发言,仅在本会话的发送端被拼进了消息文本。 */
+function stripInjectedContext(text) {
+  const paras = String(text).split(/\n{2,}/);
+  const kept = paras.filter((p) => {
+    const t = p.trim();
+    return !/^Current runtime context\./.test(t) &&
+           !/^Current DSH file policy:/.test(t) &&
+           !/^Approval policy:/.test(t) &&
+           !/^This snapshot supersedes earlier runtime-context snapshots/.test(t);
+  });
+  return kept.join('\n\n');
+}
+function sanitizeTextPart(p) {
+  if (p && p.kind === 'text') return { ...p, text: stripInjectedContext(p.text) };
+  return p;
+}
+
 function renderChatItem(it, sessionId, knownIds) {
   if (it.kind === 'msg') {
     const wrap = el('div', `msg ${it.role}`);
     const bubble = el('div', 'bubble');
-    bubble.innerHTML = partsHtml(it.parts, knownIds);
+    const parts = it.role === 'user' ? it.parts.map(sanitizeTextPart) : it.parts;
+    bubble.innerHTML = partsHtml(parts, knownIds, sessionId, it.id);
     wrap.appendChild(bubble);
     return wrap;
   }
   if (it.kind === 'live') {
     const wrap = el('div', 'msg assistant');
+    wrap.dataset.live = `${sessionId}:${it.key}`; // 供增量更新定位,避免整条重建
     const bubble = el('div', 'bubble');
     const html = [];
-    if (it.reasoning) html.push(thinkHtml(it.reasoning, !it.text)); // 纯思考阶段自动展开,出正文后收起
+    // 纯思考阶段默认展开;用户手动收起/展开会被记住(重渲染不重置)
+    if (it.reasoning) html.push(thinkHtml(it.reasoning, `${sessionId}|live:${it.key}`, !it.text));
     if (it.text) html.push(`<div class="md">${mdHtml(it.text)}</div>`);
     html.push('<span class="typing"></span>');
     bubble.innerHTML = html.join('\n');
@@ -1103,6 +1383,16 @@ function renderChatItem(it, sessionId, knownIds) {
   if (it.kind === 'tool') {
     const wrap = el('div', 'msg tool');
     wrap.innerHTML = toolCardHtml(it);
+    return wrap;
+  }
+  if (it.kind === 'compact') {
+    // 压缩标记:不展示被压缩/摘要内容
+    const bits = [];
+    if (it.shadowed) bits.push(`${it.shadowed} 条历史记录`);
+    if (it.tokens) bits.push(`约 ${fmtTokens(it.tokens)} tokens`);
+    const detail = bits.length ? ' ' + esc(`(${bits.join(', ')})`) : '';
+    const wrap = el('div', 'msg compact');
+    wrap.innerHTML = `<div class="compact-marker"><span class="c-ic">${icon('fold')}</span><span>上下文已压缩${detail}</span></div>`;
     return wrap;
   }
   if (it.kind === 'pending') {
@@ -1151,8 +1441,9 @@ function rerenderChat() {
     body.appendChild(sec);
   }
   refreshTitles();
-  // 贴底策略:打开时/本来就在底部时自动滚到最新;用户上翻时不再打扰
-  if (stickBottom || nearBottom(body)) { scrollBottomEl(body, false); stickBottom = true; }
+  // 贴底策略:仅当用户本来就停在底部(或刚打开/刚发送)时自动滚到最新;
+  // 用户上翻后绝不拽回
+  if (stickBottom) { scrollBottomEl(body, false); }
   syncChatUi(body);
   renderImagesAsync(sid, body);
 }
@@ -1187,8 +1478,8 @@ async function renderImagesAsync(sessionId, root) {
       img.style.maxWidth = '100%';
       img.style.borderRadius = '8px';
       holder.appendChild(img);
-      // 图片加载后高度变化:仍贴底时跟随滚到最新
-      if (stickBottom || nearBottom(root)) { scrollBottomEl(root, false); syncChatUi(root); }
+      // 图片加载后高度变化:仅当仍贴底时跟随
+      if (stickBottom) { scrollBottomEl(root, false); syncChatUi(root); }
     } catch {
       holder.textContent = '图片加载失败';
     }
@@ -1206,6 +1497,7 @@ async function sendPrompt() {
   const text = (input.value || '').trim();
   if (!text || !state.session) return;
   input.value = '';
+  input.style.height = ''; // 重置自动长高
   const sid = state.session;
   const flow = ensureFlow(sid);
   flow.push({ kind: 'pending', id: 'pend-' + uuid(), text, createdAt: Date.now() });
@@ -1282,8 +1574,19 @@ function bindShell() {
   document.querySelector('[data-act="chat-menu"]').onclick = chatMenu;
   document.querySelector('[data-act="fullscreen"]').onclick = toggleFullscreen;
   const input = document.querySelector('[data-role="composer-input"]');
+  // 输入框随内容自动长高(上限 140px)
+  const autoGrow = () => {
+    input.style.height = 'auto';
+    input.style.height = Math.min(input.scrollHeight, 140) + 'px';
+  };
+  input.addEventListener('input', autoGrow);
+  // Enter 一律插入换行(中文输入法组合确认也不误发);发送请点右侧 ↑ 按钮,
+  // 桌面键盘可用 Ctrl/Cmd+Enter 快捷发送。
   input.onkeydown = (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendPrompt(); }
+    if (e.key === 'Enter' && !e.shiftKey && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      sendPrompt();
+    }
   };
   document.querySelector('[data-act="logout"]').onclick = async () => {
     await doLogout();
@@ -1297,9 +1600,11 @@ function bindShell() {
   const chatBody = document.querySelector('[data-role="chat-body"]');
   const onScroll = () => {
     if (!state.session) return;
-    if (chatBody.scrollHeight - chatBody.scrollTop - chatBody.clientHeight < 150) stickBottom = true;
-    else stickBottom = false;
+    // 只有“几乎贴在底部”才跟随;用户一上滑(>48px)立即停止自动滚动,不再被拽回
+    stickBottom = nearBottom(chatBody, 48);
     syncChatUi(chatBody);
+    // 滚到顶部且还有更早记录 → 自动向前加载一页
+    if (chatBody.scrollTop < 60 && !nearBottom(chatBody) && !loadingMore) loadOlder(state.session);
   };
   chatBody.addEventListener('scroll', onScroll, { passive: true });
   document.querySelector('[data-act="goto-bottom"]').onclick = () => {
@@ -1319,7 +1624,14 @@ function bindShell() {
       return;
     }
     const thinkHead = e.target.closest('.think .think-head');
-    if (thinkHead) { thinkHead.closest('.think').classList.toggle('open'); return; }
+    if (thinkHead) {
+      const box = thinkHead.closest('.think');
+      const k = box.dataset.think || '';
+      const nowOpen = box.classList.contains('open');
+      box.classList.toggle('open', !nowOpen);
+      if (k) thinkOverrides.set(k, !nowOpen); // 记住手动状态,流式重渲染时不再复位
+      return;
+    }
     const childHead = e.target.closest('.child-head');
     if (childHead) { childHead.closest('.child-section').classList.toggle('closed'); }
   });
