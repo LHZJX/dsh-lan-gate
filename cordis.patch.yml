@@ -1,0 +1,11 @@
+# dsh-lan-gate bundle patch.
+#
+# Mounts this package as a plugin row. Unlike v0.1, this bundle does NOT
+# override the webserver row: the web server boots on 127.0.0.1 (the DSH
+# default) and the plugin's host half re-binds it at runtime according to the
+# mode chosen in the Settings UI — 仅本机 / 所有网卡 / 指定网卡 IP — with
+# immediate effect and no restart.
+
+- insert:
+    - id: lan-gate
+      name: dsh-lan-gate

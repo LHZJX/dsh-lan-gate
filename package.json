@@ -1,0 +1,29 @@
+{
+  "name": "dsh-lan-gate",
+  "version": "0.2.6",
+  "description": "LAN access gate for the DeepSeek Harness Web UI: requires a password for every non-local (LAN/phone) request, with a bind mode switchable live from a Settings page — 仅本机 / 所有网卡 / 指定网卡 IP (auto-detected dropdown) — plus a computer-side password manager with immediate effect.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime"
+      ]
+    }
+  }
+}
