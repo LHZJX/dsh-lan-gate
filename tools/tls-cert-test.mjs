@@ -99,4 +99,46 @@ if (drift1.changed !== true || drift2.changed !== false || !hasTailscale) {
   console.error('FAIL: SAN 漂移未自动重建')
   process.exit(1)
 }
+
+// 5) IPv6:任意字面量可进证书 SAN;展开/URL 规范化正确
+//    注:Node 打印 SAN 的 IPv6 是大写且不补零(FD00:0:0:0:0:0:1234:ABCD),
+//    expandIpv6 会把两边统一成小写补零形式做漂移比较。
+const v6expandOk =
+  internals.expandIpv6('::1') === '0000:0000:0000:0000:0000:0000:0000:0001' &&
+  internals.expandIpv6('fd00::1234:abcd') === 'fd00:0000:0000:0000:0000:0000:1234:abcd' &&
+  internals.expandIpv6('fd00:0:0:0:0:0:1234:abcd') === 'fd00:0000:0000:0000:0000:0000:1234:abcd' &&
+  internals.expandIpv6('not-an-ip') === null
+const v6urlOk =
+  internals.urlHost('240e::1') === '[240e::1]' && internals.urlHost('192.168.3.5') === '192.168.3.5'
+const v6cert = internals.buildSelfSignedCert(['localhost', '127.0.0.1', '::1', 'fd00::1234:abcd'])
+const v6sanText = new X509Certificate(v6cert.cert).subjectAltName ?? ''
+const v6sanOk = /fd00/i.test(v6sanText) && v6sanText.includes('1234') && /abcd/i.test(v6sanText)
+console.log('IPv6 展开规范化:', v6expandOk)
+console.log('IPv6 URL 方括号:', v6urlOk)
+console.log('证书 SAN 含 fd00::1234:abcd:', v6sanOk, '(' + (v6sanText.match(/IP Address:[^,]*fd00[^,]*/i) || ['n/a'])[0] + ')')
+if (!v6expandOk || !v6urlOk || !v6sanOk) {
+  console.error('FAIL: IPv6 SAN/规范化异常')
+  process.exit(1)
+}
+
+// 6) IPv6 SAN 漂移:旧证书缺 v6 → 自动重建;重建后 canonical 一致,二次复用不再重建
+const tmpHome3 = mkdtempSync(join(tmpdir(), 'dsh-tls-v6-'))
+const dir3 = join(tmpHome3, 'lan-gate-tls')
+mkdirSync(dir3, { recursive: true })
+const stale6 = internals.buildSelfSignedCert(['localhost', '127.0.0.1', '::1']) // 旧证书:无 v6 网卡条目
+writeFileSync(join(dir3, 'cert.pem'), stale6.cert)
+writeFileSync(join(dir3, 'key.pem'), stale6.key)
+process.env.DSH_HOME = tmpHome3
+const s3 = internals.createState()
+s3.boundHost = 'fd00::1234:abcd'
+const v6a = await internals.ensureTlsCert(s3)
+const v6b = await internals.ensureTlsCert(s3)
+const v6rebuiltSan = (new X509Certificate(v6a.cert).subjectAltName ?? '')
+const v6rebuiltOk = v6a.changed === true && /fd00/i.test(v6rebuiltSan) && /abcd/i.test(v6rebuiltSan)
+console.log('v6 SAN 漂移后自动重建:', v6rebuiltOk)
+console.log('v6 重建后二次复用(changed=false):', v6b.changed === false)
+if (!v6rebuiltOk || v6b.changed !== false) {
+  console.error('FAIL: IPv6 漂移/复用异常')
+  process.exit(1)
+}
 console.log('tls-cert-test: PASS')

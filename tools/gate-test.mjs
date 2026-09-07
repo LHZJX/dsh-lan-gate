@@ -262,7 +262,8 @@ console.log('\n[C. bind engine (live rebind + loopback twin + fence)]')
   await new Promise((resolve) => server2.listen(0, '127.0.0.1', resolve))
   const port2 = server2.address().port
   const detected = internals.detectAddrs()
-  const specific = detected[0]?.address
+  // 优先取 IPv4 做「指定网卡」用例(避免 IPv6 字面量在 URL 里需要方括号的干扰)
+  const specific = detected.find((d) => String(d.address).includes('.'))?.address
 
   const fenceList = []
   const routeHandler = { handler: originalRootHandler }
