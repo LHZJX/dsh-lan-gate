@@ -1,6 +1,6 @@
 {
   "name": "dsh-lan-gate",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "LAN access gate for the DeepSeek Harness Web UI: requires a password for every non-local (LAN/phone) request, with a bind mode switchable live from a Settings page — 仅本机 / 所有网卡 / 指定网卡 IP (auto-detected dropdown) — plus a computer-side password manager with immediate effect.",
   "type": "module",
   "main": "lib/index.js",

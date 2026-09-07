@@ -2,7 +2,7 @@
 import { X509Certificate } from 'node:crypto'
 import { createServer } from 'node:https'
 import { request } from 'node:https'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { readFile } from 'node:fs/promises'
@@ -75,6 +75,28 @@ console.log('tlsDesired:', internals.tlsDesired({ tls: { enabled: true, port: 34
 
 if (!first.cert.startsWith('-----BEGIN CERTIFICATE-----') || !reused || !onDiskOk) {
   console.error('FAIL: ensureTlsCert 异常')
+  process.exit(1)
+}
+
+// 4) SAN 漂移自动重建(如 Tailscale 等新网卡上线后旧证书缺该 IP → 应重建并热返回新证书)
+const tmpHome2 = mkdtempSync(join(tmpdir(), 'dsh-tls-drift-'))
+const dir2 = join(tmpHome2, 'lan-gate-tls')
+mkdirSync(dir2, { recursive: true })
+const stale = internals.buildSelfSignedCert(['localhost', '127.0.0.1', '::1', '192.168.3.5']) // 旧证书:无 Tailscale IP
+writeFileSync(join(dir2, 'cert.pem'), stale.cert)
+writeFileSync(join(dir2, 'key.pem'), stale.key)
+process.env.DSH_HOME = tmpHome2
+const s2 = internals.createState()
+s2.boundHost = '100.83.142.119'
+const drift1 = await internals.ensureTlsCert(s2)
+const drift2 = await internals.ensureTlsCert(s2)
+const driftCert = new X509Certificate(drift1.cert)
+const hasTailscale = (driftCert.subjectAltName ?? driftCert.subjectaltname ?? '').includes('100.83.142.119')
+console.log('SAN 漂移后自动重建:', drift1.changed === true)
+console.log('重建后二次复用(changed=false):', drift2.changed === false)
+console.log('新证书 SAN 含 Tailscale IP(100.83.142.119):', hasTailscale)
+if (drift1.changed !== true || drift2.changed !== false || !hasTailscale) {
+  console.error('FAIL: SAN 漂移未自动重建')
   process.exit(1)
 }
 console.log('tls-cert-test: PASS')
