@@ -283,7 +283,8 @@ function foldHistoryEvents(events, sessionId) {
 }
 
 async function loadHistory(sessionId) {
-  const { events, hasMore } = await rpc('session.history', { sessionId, maxMessages: 50 });
+  // 初始页:普通会话 30 条足够;超大会话若已被自适应调小(histPageSize<30),沿用调小后的页宽
+  const { events, hasMore } = await rpc('session.history', { sessionId, maxMessages: Math.min(30, histPageSize) });
   const flow = ensureFlow(sessionId);
   flow.length = 0;
   const { items, leftovers, minSeq } = foldHistoryEvents(events, sessionId);
@@ -304,11 +305,14 @@ async function loadHistory(sessionId) {
 }
 
 let loadingMore = false;
+let domPatched = false; // 本次实时事件已就地补丁 DOM(阅读历史时不再整表重建)
+const atEndShown = new Set(); // 已在该会话顶部显示“已到最早/压缩到底”提示
+let histPageSize = 50; // session.history 每页消息数;超大会话自动调小,避免手机端单页十几 MB 卡死
 
 /** 向前加载更早记录。若某整页全是被压缩遮蔽(无可渲染项)的内容,自动连续向前翻,
  *  直到出现可见内容或翻到最早,避免“卡在遮蔽段”永远到不了顶。 */
 async function loadOlder(sessionId) {
-  if (loadingMore || !sessionId) return;
+  if (loadingMore || !sessionId || atEndShown.has(sessionId)) return;
   const body = document.querySelector('[data-role="chat-body"]');
   const inView = state.session === sessionId && !!body;
   loadingMore = true;
@@ -319,22 +323,28 @@ async function loadOlder(sessionId) {
   }
   try {
     let pre = [];
+    let endReached = false; // 服务端确认已到最早
     for (let guard = 0; guard < 60; guard++) {
       const floor = flowFloors.get(sessionId);
-      if (!floor || !floor.min || !floor.hasMore) break; // 已到最早
+      if (!floor || !floor.min || !floor.hasMore) { endReached = true; break; } // 已到最早
       // 单次请求 30s 超时,避免网络卡死时 loadingMore 永远占位
       const ctrl = typeof AbortController === 'undefined' ? null : new AbortController();
       const timer = ctrl ? setTimeout(() => ctrl.abort(), 30000) : null;
       let page;
       try {
-        page = await rpc('session.history', { sessionId, beforeSeq: floor.min, maxMessages: 50 }, ctrl);
+        page = await rpc('session.history', { sessionId, beforeSeq: floor.min, maxMessages: histPageSize }, ctrl);
       } finally {
         if (timer) clearTimeout(timer);
       }
       const events = (page && page.events) || [];
+      // 超大页自适应:每页事件太多(流式 chunk 全量返回)说明消息跨度大,
+      // 自动减小每页消息数,降低手机端单次下载/解析体积;页小了就恢复
+      if (events.length > 20000) histPageSize = Math.max(12, Math.round(histPageSize / 2));
+      else if (events.length < 6000 && histPageSize < 50) histPageSize = Math.min(50, histPageSize * 2);
       const hasMore = !!(page && page.hasMore);
       if (!events.length) {
         flowFloors.set(sessionId, { min: null, hasMore: false });
+        endReached = true;
         break;
       }
       const { items, leftovers, minSeq } = foldHistoryEvents(events, sessionId);
@@ -347,6 +357,7 @@ async function loadOlder(sessionId) {
       flowFloors.set(sessionId, { min: Number.isFinite(minSeq) ? minSeq : null, hasMore: !!hasMore });
       if (pageItems.length) { pre = pageItems; break; }
       // 本页没有可见内容(整页为压缩遮蔽):不插入 DOM,继续向前翻
+      if (!hasMore) { endReached = true; break; }
       if (state.session !== sessionId) break; // 用户已离开该会话,停止继续空翻
     }
     if (inView && pre.length && state.session === sessionId) {
@@ -363,16 +374,77 @@ async function loadOlder(sessionId) {
       body.scrollTop = prevTop + (body.scrollHeight - prevH);
       renderImagesAsync(sessionId, body);
       syncChatUi(body);
-    } else if (inView && mark && mark.isConnected) {
-      mark.remove();
+    } else if (inView && state.session === sessionId) {
+      if (mark && mark.isConnected) mark.remove();
+      // 顶部没有更多可展示内容:放一条静态提示,避免“无声卡住”看起来像死墙,
+      // 并记住状态,防止每次滚到顶都重复发起空翻页
+      const fl = flowFloors.get(sessionId);
+      if (!pre.length) atEndShown.add(sessionId);
+      insertEndMarker(body, sessionId,
+        endReached ? '已到最早记录' : '更早内容已全部被上下文压缩遮蔽');
       syncChatUi(body);
+    } else if (mark && mark.isConnected) {
+      mark.remove(); // 用户已离开该会话:清理临时加载提示
     }
   } catch {
-    if (mark && mark.isConnected) mark.remove();
+    if (inView && mark && mark.isConnected) {
+      // 失败:原地变成可点击的“点此重试”,而不是无声消失(否则顶部像被卡死)
+      mark.className = 'msg load-fail-row';
+      mark.innerHTML = '<span class="load-fail">加载更早记录失败,点此重试</span>';
+      mark.onclick = (ev) => {
+        ev.stopPropagation();
+        if (loadingMore) return;
+        mark.remove();
+        loadOlder(sessionId);
+      };
+    }
     toast('加载更早记录失败');
   } finally {
     loadingMore = false;
   }
+}
+
+/** 列表最顶部插入一条“已到最早/更早内容被压缩”的静态提示(不参与 flow,重建时由 rerenderChat 补回)。 */
+function insertEndMarker(body, sessionId, text) {
+  if (!body || !sessionId || body.querySelector('.msg.at-end')) return;
+  const m = el('div', 'msg at-end', `<span class="end-hint">${esc(text || '已到最早记录')}</span>`);
+  body.insertBefore(m, body.firstChild);
+}
+
+/** 重建后若已知该会话已翻到最早,把静态提示放回列表顶部。 */
+function maybeShowEndMarker(body, sid) {
+  if (!body || !sid) return;
+  const shown = atEndShown.has(sid);
+  const fl = flowFloors.get(sid);
+  if (!shown && (!fl || fl.hasMore)) return;
+  insertEndMarker(body, sid, '已到最早记录');
+}
+
+/** 阅读历史(非贴底)时:新工具卡直接追加到聊天列表末尾,与 flow 追加位置一致。 */
+function appendToolCardDom(item) {
+  const body = document.querySelector('[data-role="chat-body"]');
+  if (!body || !state.session) return false;
+  const wrap = renderChatItem(item, state.session, new Set());
+  if (!wrap) return false;
+  body.appendChild(wrap);
+  return true;
+}
+
+/** 阅读历史(非贴底)时:就地刷新已渲染工具卡的状态/输出,避免整表重建打断阅读。 */
+function updateToolCardDom(callId, item) {
+  const body = document.querySelector('[data-role="chat-body"]');
+  if (!body) return false;
+  let card = null;
+  for (const c of body.querySelectorAll('.toolcard')) {
+    if (c.dataset.tool === callId) { card = c; break; }
+  }
+  if (!card) return false;
+  const tmp = document.createElement('div');
+  tmp.innerHTML = toolCardHtml(item);
+  const fresh = tmp.firstElementChild;
+  if (!fresh) return false;
+  card.replaceWith(fresh);
+  return true;
 }
 
 function toolResultCallId(data) {
@@ -407,6 +479,7 @@ function applyLiveEvent(sessionId, event) {
   const data = event.data || {};
   const flow = ensureFlow(sessionId);
   let changed = false;
+  domPatched = false; // 每次事件重置:默认走整表重建,就地补丁成功则跳过
 
   // 压缩生命周期 / checkpoint 消息:更新进度状态;标记由 checkpoint 到达后的重建呈现
   if (type === 'compaction/start' || type === 'compaction/summary' || type === 'compaction/end' ||
@@ -475,7 +548,10 @@ function applyLiveEvent(sessionId, event) {
   } else if (type === 'tool/call') {
     const callId = data.callId;
     if (!flow.some((x) => x.kind === 'tool' && x.callId === callId)) {
-      flow.push({ kind: 'tool', id: 'tool-' + callId, callId, name: data.name || 'tool', argsRaw: data.arguments || '', state: 'running', startedAt: event.time });
+      const item = { kind: 'tool', id: 'tool-' + callId, callId, name: data.name || 'tool', argsRaw: data.arguments || '', state: 'running', startedAt: event.time };
+      flow.push(item);
+      // 阅读历史(非贴底)时:新工具卡直接原地追加,不整表重建打断滚动位置
+      if (sessionId === state.session && !stickBottom) domPatched = appendToolCardDom(item);
       changed = true;
     }
   } else if (type === 'tool/result') {
@@ -487,6 +563,8 @@ function applyLiveEvent(sessionId, event) {
       item.finishedAt = event.time;
       item.output = blocksToText((data.message && data.message.content) || []);
       item.errorMsg = data.error && (data.error.message || data.error.code);
+      // 阅读历史(非贴底)时:就地刷新工具卡内容(状态/输出),不动整表
+      if (sessionId === state.session && !stickBottom) domPatched = updateToolCardDom(callId, item);
       changed = true;
     }
   } else if (type === 'turn/end') {
@@ -506,7 +584,7 @@ function applyLiveEvent(sessionId, event) {
     }
     state.seqBySession.set(sessionId, Math.max(typeof last === 'number' ? last : -1, event.seq));
   }
-  if (changed && sessionId === state.session) scheduleRerender();
+  if (changed && sessionId === state.session && !domPatched) scheduleRerender();
   return changed;
 }
 
@@ -618,7 +696,11 @@ function connectStreams() {
   closeStreams();
   const open = (path, handler) => {
     let ws;
-    try { ws = new WebSocket(`ws://${location.host}${path}`); } catch { return null; }
+    try {
+      // https 页面必须用 wss,否则浏览器/WebView 会拒绝明文 WS 混合内容
+      const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+      ws = new WebSocket(`${scheme}://${location.host}${path}`);
+    } catch { return null; }
     ws.onmessage = (ev) => {
       try { handler(JSON.parse(ev.data)); } catch { /* 坏帧忽略 */ }
     };
@@ -1299,12 +1381,25 @@ function renderList() {
     head.onclick = () => { toggleWsClosed(g.key); grp.classList.toggle('closed'); };
     const bodyWrap = el('div', 'group-body');
     for (const s of g.rows) {
-      const row = el('div', 'sess-item', `
+      const front = el('div', 'sess-item swipe-front', `
         <div class="s-title">${esc(sessionTitleOf(s))}</div>
         <div class="s-meta">${s.running ? '<span class="s-dot">● 运行中</span>' : ''}<span>${timeAgo(s.updatedAt)}</span></div>
       `);
-      row.onclick = () => openSession(s.sessionId);
-      bodyWrap.appendChild(row);
+      front.onclick = () => openSession(s.sessionId);
+      const acts = el('div', 'swipe-actions');
+      const act = (cls, label, fn) => {
+        const b = el('button', 'sw-act ' + cls, label);
+        b.type = 'button';
+        b.onclick = (ev) => { ev.stopPropagation(); fn(); };
+        return b;
+      };
+      acts.appendChild(act('act-del', '删除', () => confirmDelete(s.sessionId)));
+      acts.appendChild(act('act-fork', '分叉', () => forkList(s.sessionId)));
+      acts.appendChild(act('act-arc', '归档', () => confirmArchive(s.sessionId)));
+      const sw = el('div', 'swipe');
+      sw.appendChild(acts);
+      sw.appendChild(front);
+      bodyWrap.appendChild(sw);
     }
     grp.appendChild(head);
     grp.appendChild(bodyWrap);
@@ -1553,17 +1648,17 @@ async function compactNow() {
 }
 
 /** 长按某条消息 → “从此分叉”(session.fork,atSeq=该消息 seq)。 */
-function forkFrom(seq) {
-  const sid = state.session;
-  if (!sid || !Number.isFinite(seq)) return;
+/** 会话列表级分叉:从该会话末尾(最后一个完整回合)复制出新分支,原会话保持不变。 */
+function forkList(sid) {
+  if (!sid) return;
   const box = el('div', 'menu');
   box.appendChild(el('div', 'menu-title', '分叉会话'));
-  box.appendChild(el('div', 'menu-hint', '从此消息处开一个新会话分支继续对话,原会话保持不变。'));
+  box.appendChild(el('div', 'menu-hint', '从该会话末尾(最后一个完整回合)复制出一个新分支继续对话,原会话保持不变。'));
   const go = el('div', 'menu-item accent', '分叉为新会话');
   go.onclick = async () => {
     hideModal();
     try {
-      const { sessionId } = await rpc('session.fork', { sessionId: sid, atSeq: seq });
+      const { sessionId } = await rpc('session.fork', { sessionId: sid });
       await loadSessions();
       await loadWorkspaces();
       renderList();
@@ -1598,12 +1693,12 @@ function chatMenu() {
   const arc = el('div', 'menu-item', '归档此会话(仅隐藏,数据保留)');
   arc.onclick = () => { hideModal(); confirmArchive(); };
   box.appendChild(arc);
-  box.appendChild(el('div', 'menu-hint', '长按任意消息 = 分叉会话;删除 = 物理删除,需电脑端 dsh-session-delete 插件;运行中的任务会被拒绝。'));
+  box.appendChild(el('div', 'menu-hint', '会话列表:向左滑动会话行 = 删除 / 分叉 / 归档。删除需电脑端 dsh-session-delete 插件;运行中的会话无法删除。'));
   showModal(box);
 }
 
-function confirmDelete() {
-  const sid = state.session;
+function confirmDelete(sid) {
+  sid = sid || state.session;
   if (!sid) return;
   const card = el('div', 'login-card', `
     <h1>永久删除此会话?</h1>
@@ -1635,13 +1730,14 @@ function confirmDelete() {
       await loadSessions();
       await loadWorkspaces();
     } catch { /* ignore */ }
-    backToList();
+    if (state.session === sid) backToList();
+    else renderList();
   };
   showModal(card);
 }
 
-function confirmArchive() {
-  const sid = state.session;
+function confirmArchive(sid) {
+  sid = sid || state.session;
   if (!sid) return;
   const card = el('div', 'login-card', `
     <h1>归档此会话?</h1>
@@ -1660,7 +1756,8 @@ function confirmArchive() {
       await loadSessions();
       hideModal();
       toast('已归档');
-      backToList();
+      if (state.session === sid) backToList();
+      else renderList();
     } catch (e) {
       err.textContent = '归档失败:' + e.message;
       okBtn.disabled = false; okBtn.textContent = '归档';
@@ -1712,10 +1809,14 @@ function sanitizeTextPart(p) {
 
 function renderChatItem(it, sessionId, knownIds) {
   if (it.kind === 'msg') {
+    let parts = it.parts;
+    if (it.role === 'user') {
+      // 平台注入的运行上下文快照逐段过滤;整条过滤后为空 → 不渲染空气泡
+      parts = it.parts.map(sanitizeTextPart).filter((p) => !(p && p.kind === 'text' && !String(p.text).trim()));
+      if (!parts.length) return null;
+    }
     const wrap = el('div', `msg ${it.role}`);
-    if (it.seq) wrap.dataset.seq = String(it.seq); // 供“长按分叉”定位
     const bubble = el('div', 'bubble');
-    const parts = it.role === 'user' ? it.parts.map(sanitizeTextPart) : it.parts;
     bubble.innerHTML = partsHtml(parts, knownIds, sessionId, it.id);
     wrap.appendChild(bubble);
     return wrap;
@@ -1765,6 +1866,8 @@ function rerenderChat() {
   const sid = state.session;
   const flow = state.flow.get(sid) || [];
   const knownIds = knownToolCallIds(sid);
+  // 用户上翻阅读时重建:记录原滚动位置,重建后恢复(防止整表重建把阅读位置拽走/归零)
+  const keepPos = (!stickBottom && body.scrollHeight > body.clientHeight && body.scrollTop > 0) ? body.scrollTop : 0;
   body.replaceChildren();
   updateCompactBar(); // 压缩进度条:固定在顶栏下方,不随消息滚动(旧实现放在滚动区顶部,长会话里根本看不到)
   for (const it of flow) {
@@ -1796,8 +1899,13 @@ function rerenderChat() {
   }
   refreshTitles();
   // 贴底策略:仅当用户本来就停在底部(或刚打开/刚发送)时自动滚到最新;
-  // 用户上翻后绝不拽回
-  if (stickBottom) { scrollBottomEl(body, false); }
+  // 用户上翻后绝不拽回,并显式恢复原阅读位置
+  if (stickBottom) {
+    scrollBottomEl(body, false);
+  } else if (keepPos) {
+    body.scrollTop = Math.min(keepPos, body.scrollHeight - body.clientHeight);
+  }
+  maybeShowEndMarker(body, sid);
   syncChatUi(body);
   renderImagesAsync(sid, body);
 }
@@ -2341,34 +2449,107 @@ function bindShell() {
     if (childHead) { childHead.closest('.child-section').classList.toggle('closed'); }
   });
 
-  // 长按任意消息 → 分叉会话(与电脑版"从此消息分叉"一致)
-  let lpTimer = null;
-  let lpPos = null;
-  const lpCancel = () => {
-    if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; }
-    lpPos = null;
+  // 会话列表行左滑:删除 / 分叉 / 归档(委托到列表容器,重渲染后仍有效)
+  const SW_ACTION_W = 192; // 3 × 64px
+  const listScroller = document.querySelector('[data-role="list-body"]');
+  const applySwipeX = (sw, x) => {
+    const fr = sw.querySelector('.swipe-front');
+    const ac = sw.querySelector('.swipe-actions');
+    if (fr) fr.style.transform = `translateX(${x}px)`;
+    if (ac) ac.style.transform = `translateX(${SW_ACTION_W + x}px)`;
   };
-  chatBody.addEventListener('pointerdown', (e) => {
-    lpCancel();
-    if (!state.session) return;
-    if (e.target.closest('button, a, textarea, input')) return;
-    if (e.pointerType === 'mouse' && e.button !== 0) return;
-    const wrap = e.target.closest('.msg');
-    if (!wrap) return;
-    const seq = Number(wrap.dataset.seq);
-    if (!Number.isFinite(seq) || seq <= 0) return;
-    lpPos = [e.clientX, e.clientY];
-    lpTimer = setTimeout(() => {
-      lpTimer = null;
-      lpPos = null;
-      forkFrom(seq);
-    }, 520);
-  });
-  chatBody.addEventListener('pointermove', (e) => {
-    if (lpTimer && lpPos && (Math.abs(e.clientX - lpPos[0]) > 12 || Math.abs(e.clientY - lpPos[1]) > 12)) lpCancel();
-  });
-  chatBody.addEventListener('pointerup', lpCancel);
-  chatBody.addEventListener('pointercancel', lpCancel);
+  const resetSwipeX = (sw) => {
+    const fr = sw.querySelector('.swipe-front');
+    const ac = sw.querySelector('.swipe-actions');
+    if (fr) fr.style.transform = '';
+    if (ac) ac.style.transform = '';
+  };
+  const closeAllSwipes = () => {
+    if (listScroller) for (const o of listScroller.querySelectorAll('.swipe.open')) o.classList.remove('open');
+  };
+  // 手势状态。灵敏度要点:
+  //  - 方向判定前累计 ~14px 再裁决,容忍手指起始抖动,不再一有纵向分量就放弃;
+  //  - 锁定横向后 setPointerCapture,手指滑出行/列表边界仍然持续跟手;
+  //  - 配合 CSS 的 touch-action: pan-y,横向手势不会被系统滚动中途掐断;
+  //  - 松开时若为快速甩动(<280ms 且横向位移≥34px)直接按方向吸附,
+  //    不必拖过半程——解决“左滑划不出 / 右滑收不进”的生涩感。
+  let drag = null;
+  if (listScroller) {
+    listScroller.addEventListener('pointerdown', (e) => {
+      if (!e.isPrimary) return;
+      const sw = e.target.closest('.swipe');
+      if (!sw || e.target.closest('.sw-act')) return;
+      drag = {
+        id: e.pointerId, sw: sw, x: e.clientX, y: e.clientY,
+        dx: 0, flickDx: 0, lastT: performance.now(), moved: false,
+        open: sw.classList.contains('open')
+      };
+    });
+    listScroller.addEventListener('pointermove', (e) => {
+      if (!drag || drag.id !== e.pointerId) return;
+      const dx = e.clientX - drag.x;
+      const dy = e.clientY - drag.y;
+      if (!drag.moved) {
+        if (Math.abs(dx) + Math.abs(dy) < 14) return;        // 起动容差:累计后再判方向
+        if (Math.abs(dy) > Math.abs(dx)) { drag = null; return; } // 纵向占优 → 交给原生滚动/下拉刷新
+        drag.moved = true;
+        drag.sw.classList.add('dragging');
+        closeAllSwipes();
+        try { listScroller.setPointerCapture(e.pointerId); } catch (err) { /* 内核不支持则忽略 */ }
+      }
+      drag.flickDx = dx; // 未裁剪的原始横向位移,供快速甩动判向
+      drag.lastT = performance.now(); // 末次移动时刻:据此识别"甩动"(松开前一刻还在快速移动)
+      const base = drag.open ? -SW_ACTION_W : 0;
+      const nx = Math.max(-SW_ACTION_W, Math.min(0, base + dx));
+      drag.dx = nx;
+      applySwipeX(drag.sw, nx);
+      if (e.cancelable) e.preventDefault();
+    }, { passive: false });
+    // 双保险:横向拖动锁定后吞掉原生 touch 滚动(兼容不支持 touch-action 的老内核)
+    listScroller.addEventListener('touchmove', (e) => {
+      if (drag && drag.moved && e.cancelable) e.preventDefault();
+    }, { passive: false });
+    const finishSwipe = (e) => {
+      if (!drag || (e.pointerId !== undefined && drag.id !== e.pointerId)) return;
+      const sw = drag.sw;
+      const moved = drag.moved;
+      const nx = drag.dx;
+      // 松开前 ~90ms 内仍在快速移动 → 视为甩动;慢速拖拽(松手前会自然停顿)走位移阈值
+      const fast = performance.now() - drag.lastT < 90;
+      const flick = drag.flickDx;
+      sw.classList.remove('dragging');
+      drag = null;
+      if (!moved) return; // 轻点:交给 click 处理
+      // 快速甩动 → 按甩动方向吸附;慢速拖拽 → 超过 45% 行宽才吸附
+      const openIt = (fast && Math.abs(flick) >= 34) ? flick < 0 : nx < -SW_ACTION_W * 0.45;
+      sw.classList.toggle('open', openIt);
+      for (const o of listScroller.querySelectorAll('.swipe.open')) if (o !== sw) o.classList.remove('open');
+      resetSwipeX(sw);
+      sw.dataset.justSwiped = String(performance.now());
+      clearTimeout(sw._swallowT);
+      sw._swallowT = setTimeout(() => { delete sw.dataset.justSwiped; }, 320);
+    };
+    listScroller.addEventListener('pointerup', finishSwipe);
+    listScroller.addEventListener('pointercancel', finishSwipe);
+    // 捕获阶段:开着的行被点击(非按钮)→ 收起而不是打开会话;滑动刚结束 → 吞掉残留点击
+    listScroller.addEventListener('click', (e) => {
+      const sw = e.target.closest('.swipe');
+      if (!sw) return;
+      if (e.target.closest('.sw-act')) return; // 动作按钮自行处理
+      const js = sw.dataset.justSwiped;
+      if (js && performance.now() - Number(js) < 320) {
+        delete sw.dataset.justSwiped;
+        e.preventDefault(); e.stopPropagation();
+        return;
+      }
+      if (sw.classList.contains('open')) {
+        e.preventDefault(); e.stopPropagation();
+        sw.classList.remove('open');
+      } else {
+        closeAllSwipes();
+      }
+    }, true);
+  }
 }
 
 async function startApp() {

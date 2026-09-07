@@ -513,10 +513,14 @@ body.bg-on.bg-blur .bubble {
 .bg-dim-row span:first-child { flex: none; }
 .bg-dim-row span:last-child { flex: none; min-width: 40px; text-align: right; }
 /* 有背景时:列表条目半透明卡片化,保证文字可读 */
-body.bg-on .sess-item {
+body.bg-on .swipe {
   background: color-mix(in srgb, var(--surface) 72%, transparent);
-  border-bottom: none; border-radius: 12px;
-  margin: 4px 12px; padding: 11px 14px 11px 20px;
+  border-radius: 12px;
+  margin: 4px 12px;
+}
+body.bg-on .sess-item.swipe-front {
+  background: transparent; border-radius: 0;
+  margin: 0; padding: 11px 14px 11px 20px;
 }
 body.bg-on .group-body { padding-bottom: 6px; }
 body.bg-on .group-title { text-shadow: 0 1px 3px rgba(0, 0, 0, 0.35); }
@@ -538,3 +542,47 @@ body.bg-on .child-section { background: color-mix(in srgb, var(--surface) 55%, t
 
 /* ── 提问卡:自定义回答输入框(有固定选项时也会显示) ── */
 .q-custom-in { min-height: 42px; margin-top: 8px; font-size: 13px; }
+
+/* ── 会话行左滑操作(删除/分叉/归档) ── */
+.swipe { position: relative; overflow: hidden; }
+/* touch-action: pan-y —— 纵向滚动交给浏览器原生处理,横向手势完整交给 JS,
+   避免系统把横向滑动误判成滚动而在中途 pointercancel(左滑划不出的主因) */
+.swipe, .swipe * { touch-action: pan-y; }
+.swipe-front {
+  position: relative;
+  transition: transform 0.18s cubic-bezier(0.25, 0.9, 0.3, 1.06);
+  -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+}
+.swipe-actions {
+  position: absolute; top: 0; right: 0; bottom: 0;
+  display: flex;
+  transform: translateX(100%); /* 默认藏在容器右侧之外 */
+  transition: transform 0.18s cubic-bezier(0.25, 0.9, 0.3, 1.06);
+  -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+}
+.swipe.open .swipe-front { transform: translateX(-192px); }
+.swipe.open .swipe-actions { transform: translateX(0); }
+.swipe.dragging .swipe-front, .swipe.dragging .swipe-actions { transition: none; }
+.sw-act {
+  width: 64px; border: none; color: #fff;
+  font-size: 13px; font-weight: 500; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+}
+.sw-act.act-del { background: #e5484d; }
+.sw-act.act-fork { background: #4d6bfe; }
+.sw-act.act-arc { background: #7c8794; }
+
+/* ── 聊天顶部边界提示:已到最早 / 加载失败点此重试 ── */
+.msg.at-end { justify-content: center; padding: 2px 0 10px; }
+.end-hint {
+  display: inline-flex; align-items: center; gap: 6px;
+  color: var(--text-3); font-size: 12px;
+}
+.msg.load-fail-row { justify-content: center; padding: 8px 0; }
+.load-fail {
+  display: inline-flex; align-items: center; gap: 6px;
+  color: var(--accent); font-size: 12px; cursor: pointer;
+  border: 1px dashed var(--border); border-radius: 999px;
+  padding: 5px 13px;
+  background: color-mix(in srgb, var(--surface) 55%, transparent);
+}
